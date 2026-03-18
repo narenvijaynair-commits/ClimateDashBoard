@@ -1,3 +1,4 @@
 cligj==0.7.2
 matplotlib==3.10.8
 munkres==1.1.4
+streamlit
