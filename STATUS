@@ -1,0 +1,6 @@
+ python pyAutheticate.py
+ This checks if earthengine connection is working. 
+
+This is failing now
+
+Ultimately we want to run 'streamlit run app.py'

@@ -1,75 +1,104 @@
-import streamlit as st
 import ee
 import geemap.foliumap as geemap
+import streamlit as st
+from datetime import datetime
 
+# -----------------------------------------------------------------------------
 # Initialize Earth Engine
+# -----------------------------------------------------------------------------
 try:
-    ee.Initialize()
-except Exception as e:
+    ee.Initialize(project='calm-vehicle-450421-v2')
+except Exception:
     ee.Authenticate()
-    ee.Initialize()
+    ee.Initialize(project='calm-vehicle-450421-v2')
 
-st.set_page_config(page_title="Global Precipitation Trend Dashboard", layout="wide")
+# -----------------------------------------------------------------------------
+# Streamlit UI Setup
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="🌍 Earth Data Dashboard", layout="wide")
+st.title("🌍 Earth Data Dashboard")
 
-st.title("🌧️ Global Precipitation Trend Dashboard")
-st.markdown("Visualizing IMERG monthly precipitation trends (2001–2023)")
+st.sidebar.header("Settings")
+dataset_choice = st.sidebar.selectbox(
+    "Select Dataset:",
+    ["IMERG Precipitation", "GRACE TWS (Mascon)"]
+)
 
-# Sidebar inputs
-with st.sidebar:
-    st.header("⚙️ Settings")
-    dataset_choice = st.selectbox("Dataset:", ["IMERG Monthly", "CHIRPS Pentad"])
-    start_date = st.date_input("Start Date", value=pd.to_datetime("2001-06-01"))
-    end_date = st.date_input("End Date", value=pd.to_datetime("2023-12-31"))
-    min_trend = st.slider("Min trend (mm/yr)", -0.01, 0.0, -0.005, 0.001)
-    max_trend = st.slider("Max trend (mm/yr)", 0.0, 0.01, 0.005, 0.001)
+start_date = st.sidebar.date_input("Start Date", datetime(2010, 1, 1))
+end_date = st.sidebar.date_input("End Date", datetime(2024, 1, 1))
 
-# Load dataset
-if dataset_choice == "IMERG Monthly":
-    dataset = ee.ImageCollection('NASA/GPM_L3/IMERG_MONTHLY_V06').select('precipitation')
-else:
-    dataset = ee.ImageCollection('UCSB-CHG/CHIRPS/PENTAD').select('precipitation')
+# -----------------------------------------------------------------------------
+# Create Map
+# -----------------------------------------------------------------------------
+m = geemap.Map(center=[0, 0], zoom=2)
 
-dataset = dataset.filterDate(str(start_date), str(end_date))
+# -----------------------------------------------------------------------------
+# IMERG Dataset (Default)
+# -----------------------------------------------------------------------------
+if dataset_choice == "IMERG Precipitation":
+    st.subheader("🌧️ IMERG Monthly Precipitation")
 
-# Define region
-region = ee.Geometry.Rectangle([-180, -60, 180, 85])
+    imerg = (
+        ee.ImageCollection("NASA/GPM_L3/IMERG_MONTHLY_V06")
+        .select("precipitation")
+        .filterDate(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+    )
 
-# Land mask
-land_mask = ee.Image('MODIS/051/MCD12Q1/2001_01_01').select('Land_Cover_Type_1').gt(0)
+    if imerg.size().getInfo() == 0:
+        st.warning("No IMERG data found for this period.")
+    else:
+        imerg_mean = imerg.mean()
+        vis = {"min": 0, "max": 300, "palette": ["#f7fbff", "#6baed6", "#08306b"]}
+        m.addLayer(imerg_mean, vis, "IMERG Precipitation (mm/month)")
 
-# Add time band
-def add_time_band(image):
-    date = ee.Date(image.get('system:time_start'))
-    years = date.difference(ee.Date(str(start_date)), 'year')
-    return image.addBands(ee.Image(years).rename('time').float())
+        # Colorbar
+        try:
+            m.add_colorbar(vis, label="IMERG Precipitation (mm/month)")
+        except Exception:
+            m.add_colorbar_branca(
+                colors=vis["palette"], vmin=vis["min"], vmax=vis["max"],
+                caption="IMERG Precipitation (mm/month)"
+            )
 
-dataset = dataset.map(add_time_band)
+# -----------------------------------------------------------------------------
+# GRACE Dataset (Mascon)
+# -----------------------------------------------------------------------------
+elif dataset_choice == "GRACE TWS (Mascon)":
+    st.subheader("💧 GRACE Total Water Storage (Mascon)")
 
-# Linear regression
-linear_fit = dataset.select(['time', 'precipitation']).reduce(ee.Reducer.linearFit())
-trend = linear_fit.select('scale').updateMask(land_mask)
+    grace = (
+        ee.ImageCollection("NASA/GRACE/MASS_GRIDS/MASCON")
+        .select("lwe_thickness")
+        .filterDate(start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
+    )
 
-# Visualization params
-trend_vis = {
-    'min': min_trend,
-    'max': max_trend,
-    'palette': ['#d73027', '#f46d43', '#fee090', '#e0f3f8', '#74add1', '#4575b4']
-}
+    if grace.size().getInfo() == 0:
+        st.warning("No GRACE data found for this period.")
+    else:
+        grace_mean = grace.mean().clip(ee.Geometry.BBox(-180, -90, 180, 90))
+        vis = {"min": -20, "max": 20, "palette": ["red", "white", "blue"]}
+        m.addLayer(grace_mean, vis, "GRACE LWE Thickness (cm)")
 
-# Create map
-m = geemap.Map(center=[10, 0], zoom=2)
-m.addLayer(trend, trend_vis, "Precipitation Trend (mm/yr)")
-m.add_colorbar(trend_vis['palette'], vmin=min_trend, vmax=max_trend, label="Trend (mm/yr)")
+        # Colorbar
+        try:
+            m.add_colorbar(vis, label="GRACE LWE Thickness (cm)")
+        except Exception:
+            m.add_colorbar_branca(
+                colors=vis["palette"], vmin=vis["min"], vmax=vis["max"],
+                caption="GRACE LWE Thickness (cm)"
+            )
 
-# Display map
-m.to_streamlit(height=600)
+# -----------------------------------------------------------------------------
+# Display Map
+# -----------------------------------------------------------------------------
+m.to_streamlit(height=650)
 
-# Optional: Add chatbot section (simple example)
-st.divider()
-st.header("💬 Ask the data assistant")
-
-user_input = st.text_input("Ask a question about precipitation trends:")
-if user_input:
-    # Placeholder chatbot (could be connected to GPT or a custom model)
-    st.write(f"🤖: Regions with strong negative trends may indicate drying over time. "
-             f"Try zooming into the affected areas for more insight!")
+# -----------------------------------------------------------------------------
+# Footer
+# -----------------------------------------------------------------------------
+st.markdown("""
+---
+**Data Sources:**
+- IMERG Monthly Precipitation: [NASA/GPM_L3/IMERG_MONTHLY_V06](https://developers.google.com/earth-engine/datasets/catalog/NASA_GPM_L3_IMERG_MONTHLY_V06)  
+- GRACE Total Water Storage (Mascon): [NASA/GRACE/MASS_GRIDS/MASCON](https://developers.google.com/earth-engine/datasets/catalog/NASA_GRACE_MASS_GRIDS_MASCON)
+""")

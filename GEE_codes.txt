@@ -1,0 +1,269 @@
+// Load the GRACE/GRACE-FO dataset (JPL Mascon solution)
+var grace = ee.ImageCollection("NASA/GRACE/MASS_GRIDS/MASCON")
+              .select("lwe_thickness"); // Liquid Water Equivalent (LWE) Thickness
+
+// Define the time range for GRACE and GRACE-FO (2002 - Present)
+var startDate = '2002-04-01';
+var endDate = '2024-01-01';
+
+// Filter dataset
+var graceFiltered = grace.filterDate(startDate, endDate);
+
+// Compute the linear trend
+var trend = graceFiltered.map(function(image) {
+  var date = ee.Date(image.get('system:time_start'));
+  var year = date.get('year').add(date.getFraction('year')); // Convert to decimal year
+  return image.addBands(ee.Image(year).float().rename('year'));
+}).reduce(ee.Reducer.linearFit());
+
+// Load land mask (MODIS Land Cover: 0 = Water, 1+ = Land)
+var landMask = ee.Image("MODIS/051/MCD12Q1/2001_01_01")
+  .select("Land_Cover_Type_1")
+  .gt(0); // Water = 0, Land = 1
+
+// Apply land mask to GRACE trend
+var maskedTrend = trend.updateMask(landMask);
+
+// Visualization parameters (Flipped: Red = Water Loss, Blue = Water Gain)
+var visParams = {
+  min: -2, // Water loss (negative trends)
+  max: 2,  // Water gain (positive trends)
+  palette: ['red', 'white', 'blue'] // Flipped compared to the previous version
+};
+
+// Center the map and add masked trend layer
+Map.centerObject(maskedTrend, 3);
+Map.addLayer(maskedTrend.select('scale'), visParams, 'GRACE TWS Trend (Land Only)');
+
+// Export the image as a PNG to Google Drive
+Export.image.toDrive({
+  image: maskedTrend.select('scale').visualize(visParams), // Apply visualization
+  description: 'GRACE_TWS_Trend',
+  folder: 'GEE_Exports', // Change this to your desired Google Drive folder
+  fileNamePrefix: 'GRACE_TWS_Trend',
+  scale: 50000, // Resolution: 50km per pixel (adjust as needed)
+  region: maskedTrend.geometry(), // Export full dataset extent
+  maxPixels: 1e13,
+  formatOptions: {
+    cloudOptimized: true
+  }
+});
+
+// Function to create a color bar
+function addColorBar(title, palette, min, max) {
+  var panel = ui.Panel({
+    style: {
+      position: 'bottom-right',
+      padding: '8px',
+      backgroundColor: 'white'
+    }
+  });
+
+  var colorBar = ui.Thumbnail({
+    image: ee.Image.pixelLonLat().select(0)
+      .multiply((max - min) / 100.0)
+      .add(min)
+      .visualize({min: min, max: max, palette: palette}),
+    params: {bbox: [0, 0, 100, 10], dimensions: '100x10'},
+    style: {stretch: 'horizontal', margin: '0px 8px'}
+  });
+
+  var labels = ui.Panel([
+    ui.Label(min.toFixed(2), {margin: '4px'}), // Negative end (red)
+    ui.Label(title, {margin: '4px', textAlign: 'center', stretch: 'horizontal'}),
+    ui.Label(max.toFixed(2), {margin: '4px', textAlign: 'right'}) // Positive end (blue)
+  ], ui.Panel.Layout.flow('horizontal'));
+
+  panel.add(labels);
+  panel.add(colorBar);
+  Map.add(panel);
+}
+
+// Add color bar for visualization
+addColorBar('GRACE TWS Trend (cm/year)', visParams.palette, visParams.min, visParams.max);
+
+
+// Load the IMERG dataset
+var dataset = ee.ImageCollection("NASA/GPM_L3/IMERG_MONTHLY_V06")
+              .select("precipitation");
+
+// Define the time range
+var startDate = '2001-01-01';
+var endDate = '2023-12-31';
+
+// Filter the dataset by date
+var filteredDataset = dataset.filterDate(startDate, endDate);
+
+// Compute the linear trend
+var trend = filteredDataset.map(function(image) {
+  var date = ee.Date(image.get('system:time_start'));
+  var year = date.get('year');
+  return image.addBands(ee.Image(year).float().rename('year'));
+}).reduce(ee.Reducer.linearFit());
+
+// Load the land mask (MODIS Land Cover: 0 = Water, 1-17 = Land)
+var landMask = ee.Image("MODIS/051/MCD12Q1/2001_01_01")
+  .select("Land_Cover_Type_1") // Select land cover type
+  .gt(0);  // Mask water (0 = water, 1+ = land)
+
+// Apply the land mask to the precipitation trend
+var maskedTrend = trend.updateMask(landMask);
+
+// Visualization parameters
+var visParams = {
+  min: -25,  // Adjust based on expected trend values
+  max: 25,
+  palette: ['red', 'white', 'blue']
+};
+
+// Center the map and add masked trend layer
+Map.centerObject(maskedTrend, 3);
+Map.addLayer(maskedTrend.select('scale'), visParams, 'Precipitation Trend (Land Only)');
+
+// Function to create a color bar
+function addColorBar(title, palette, min, max) {
+  var panel = ui.Panel({
+    style: {
+      position: 'bottom-right',
+      padding: '8px',
+      backgroundColor: 'white'
+    }
+  });
+
+  var colorBar = ui.Thumbnail({
+    image: ee.Image.pixelLonLat().select(0)
+      .multiply((max - min) / 100.0)
+      .add(min)
+      .visualize({min: min, max: max, palette: palette}),
+    params: {bbox: [0, 0, 100, 10], dimensions: '100x10'},
+    style: {stretch: 'horizontal', margin: '0px 8px'}
+  });
+
+  var labels = ui.Panel([
+    ui.Label(min.toFixed(2), {margin: '4px'}),
+    ui.Label(title, {margin: '4px', textAlign: 'center', stretch: 'horizontal'}),
+    ui.Label(max.toFixed(2), {margin: '4px', textAlign: 'right'})
+  ], ui.Panel.Layout.flow('horizontal'));
+
+  panel.add(labels);
+  panel.add(colorBar);
+  Map.add(panel);
+}
+
+// Add the color bar to the map
+addColorBar('Precipitation Trend (mm/year)', visParams.palette, visParams.min, visParams.max);
+
+var palettes = require('users/gena/packages:palettes');
+var palette = palettes.colorbrewer.RdBu[9].reverse();
+
+var vis = {
+  min: 0.0,
+  max: 100.0,
+  palette: palette,
+};
+
+var pov = ee.Image("projects/ee-beybladenaren/assets/povmap_global_subnational_infant_mortality_rates_v2_01");
+Map.addLayer(pov, vis, "POVERTY");
+
+/*
+ * Legend setup
+ */
+
+// Creates a color bar thumbnail image for use in legend from the given color
+// palette.
+function makeColorBarParams(palette) {
+  return {
+    bbox: [0, 0, 1, 0.1],
+    dimensions: '100x10',
+    format: 'png',
+    min: 0,
+    max: 1,
+    palette: palette,
+  };
+}
+
+// Create the color bar for the legend.
+var colorBar = ui.Thumbnail({
+  image: ee.Image.pixelLonLat().select(0),
+  params: makeColorBarParams(vis.palette),
+  style: {stretch: 'horizontal', margin: '0px 8px', maxHeight: '24px'},
+});
+
+// Create a panel with three numbers for the legend.
+var legendLabels = ui.Panel({
+  widgets: [
+    ui.Label(vis.min, {margin: '4px 8px'}),
+    ui.Label(
+        ((vis.max-vis.min) / 2+vis.min),
+        {margin: '4px 8px', textAlign: 'center', stretch: 'horizontal'}),
+    ui.Label(vis.max, {margin: '4px 8px'})
+  ],
+  layout: ui.Panel.Layout.flow('horizontal')
+});
+
+var legendTitle = ui.Label({
+  value: 'Map Legend: Infant mortality',
+  style: {fontWeight: 'bold'}
+});
+
+// Add the legendPanel to the map.
+var legendPanel = ui.Panel([legendTitle, colorBar, legendLabels]);
+Map.add(legendPanel);
+
+var palettes = require('users/gena/packages:palettes');
+var palette = palettes.colorbrewer.RdBu[9].reverse();
+
+var vis = {
+  min: 0.0,
+  max: 100.0,
+  palette: palette,
+};
+
+var pov = ee.Image("projects/ee-beybladenaren/assets/povmap-grdi-v1");
+Map.addLayer(pov, vis, "POVERTY");
+
+/*
+ * Legend setup
+ */
+
+// Creates a color bar thumbnail image for use in legend from the given color
+// palette.
+function makeColorBarParams(palette) {
+  return {
+    bbox: [0, 0, 1, 0.1],
+    dimensions: '100x10',
+    format: 'png',
+    min: 0,
+    max: 1,
+    palette: palette,
+  };
+}
+
+// Create the color bar for the legend.
+var colorBar = ui.Thumbnail({
+  image: ee.Image.pixelLonLat().select(0),
+  params: makeColorBarParams(vis.palette),
+  style: {stretch: 'horizontal', margin: '0px 8px', maxHeight: '24px'},
+});
+
+// Create a panel with three numbers for the legend.
+var legendLabels = ui.Panel({
+  widgets: [
+    ui.Label(vis.min, {margin: '4px 8px'}),
+    ui.Label(
+        ((vis.max-vis.min) / 2+vis.min),
+        {margin: '4px 8px', textAlign: 'center', stretch: 'horizontal'}),
+    ui.Label(vis.max, {margin: '4px 8px'})
+  ],
+  layout: ui.Panel.Layout.flow('horizontal')
+});
+
+var legendTitle = ui.Label({
+  value: 'Map Legend: Poverty',
+  style: {fontWeight: 'bold'}
+});
+
+// Add the legendPanel to the map.
+var legendPanel = ui.Panel([legendTitle, colorBar, legendLabels]);
+Map.add(legendPanel);
+

@@ -1,0 +1,775 @@
+"""
+Country Profile — All Environmental Indices
+============================================
+Shows every available climate/environmental index for a selected country,
+using the exact same data sources and loading logic as 1_HDI_Climate.py.
+
+Required files (same directory as the main app):
+    - HDR25_Statistical_Annex_HDI_Table.csv
+    - PM25_Monthly_Trend_By_Country.csv
+    - GPM_Precip_Trend_By_Country.csv
+    - GRACE_TWS_Trend_By_Country_Global.csv
+    - GISS_temperature_trend_1980_2025.nc
+    - pr_slope_ssp245.tif
+    - pr_slope_ssp585.tif
+    - tas_slope_ssp245.tif
+    - tas_slope_ssp585.tif
+"""
+
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+import numpy as np
+
+try:
+    import rasterio
+    HAS_RASTERIO = True
+except ImportError:
+    HAS_RASTERIO = False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Page config
+# ═══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="Country Profile",
+    page_icon="🔎",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CSS — dark theme matching the rest of the dashboard suite
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
+
+html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
+.stApp { background: #0f1117; color: #e8e8e8; }
+
+section[data-testid="stSidebar"] {
+    background: #161b22;
+    border-right: 1px solid #30363d;
+}
+
+[data-testid="stSidebarNav"] { display: none; }
+
+.section-header {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px;
+    color: #8b949e;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    border-bottom: 1px solid #30363d;
+    padding-bottom: 8px;
+    margin: 24px 0 16px 0;
+}
+
+h1, h2, h3 {
+    font-family: 'IBM Plex Mono', monospace !important;
+    color: #e8e8e8 !important;
+}
+
+/* metric cards */
+div[data-testid="stMetric"] {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 12px 16px;
+}
+div[data-testid="stMetric"] label      { color: #8b949e !important; font-size: 12px !important; }
+div[data-testid="stMetric"] [data-testid="stMetricValue"] { color: #e8e8e8 !important; }
+div[data-testid="stMetric"] [data-testid="stMetricDelta"] { font-size: 11px !important; }
+
+/* index card grid */
+.index-card {
+    background: linear-gradient(145deg, rgba(0,200,180,0.06), rgba(20,50,70,0.55));
+    border: 1px solid #30363d;
+    border-radius: 12px;
+    padding: 1.1rem 1.2rem;
+    height: 100%;
+}
+.index-card:hover {
+    border-color: rgba(0,200,180,0.35);
+}
+.ic-label  { font-size: 0.7rem; color: #8b949e; letter-spacing: 0.1em;
+             text-transform: uppercase; margin-bottom: 4px; }
+.ic-value  { font-family: 'IBM Plex Mono', monospace; font-size: 1.3rem;
+             font-weight: 600; margin-bottom: 2px; }
+.ic-delta  { font-size: 0.72rem; margin-bottom: 6px; }
+.ic-units  { font-size: 0.7rem; color: #8b949e; }
+.ic-source { font-size: 0.68rem; color: #4a7a8a; margin-top: 6px; }
+
+.hero-banner {
+    background: linear-gradient(135deg, rgba(0,200,180,0.1) 0%, rgba(56,178,255,0.08) 100%);
+    border: 1px solid rgba(0,200,180,0.2);
+    border-radius: 16px;
+    padding: 1.5rem 2rem;
+    margin-bottom: 1.5rem;
+}
+
+.hdi-pill {
+    display: inline-block;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.75rem;
+    padding: 3px 12px;
+    border-radius: 20px;
+    margin-left: 10px;
+    vertical-align: middle;
+}
+
+#MainMenu, footer { visibility: hidden; }
+header[data-testid="stHeader"] { background: transparent; }
+</style>
+""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Shared constants (mirrored from 1_HDI_Climate.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+CONTINENT_MAPPING = {
+    'algeria':'Africa','angola':'Africa','benin':'Africa','botswana':'Africa',
+    'burkina faso':'Africa','burundi':'Africa','cabo verde':'Africa','cape verde':'Africa',
+    'cameroon':'Africa','central african republic':'Africa','central african rep.':'Africa',
+    'central african rep':'Africa','chad':'Africa','comoros':'Africa','congo':'Africa',
+    'congo (democratic republic of the)':'Africa',"côte d'ivoire":'Africa',"cote d'ivoire":'Africa',
+    'djibouti':'Africa','egypt':'Africa','equatorial guinea':'Africa','eritrea':'Africa',
+    'eswatini':'Africa','eswatini (kingdom of)':'Africa','ethiopia':'Africa','gabon':'Africa',
+    'gambia':'Africa','ghana':'Africa','guinea':'Africa','guinea-bissau':'Africa',
+    'kenya':'Africa','lesotho':'Africa','liberia':'Africa','libya':'Africa',
+    'madagascar':'Africa','malawi':'Africa','mali':'Africa','mauritania':'Africa',
+    'mauritius':'Africa','morocco':'Africa','mozambique':'Africa','namibia':'Africa',
+    'niger':'Africa','nigeria':'Africa','rwanda':'Africa','senegal':'Africa',
+    'seychelles':'Africa','sierra leone':'Africa','somalia':'Africa','south africa':'Africa',
+    'south sudan':'Africa','sudan':'Africa','tanzania':'Africa',
+    'tanzania (united republic of)':'Africa','togo':'Africa','tunisia':'Africa',
+    'uganda':'Africa','zambia':'Africa','zimbabwe':'Africa',
+    'afghanistan':'Asia','armenia':'Asia','azerbaijan':'Asia','bahrain':'Asia',
+    'bangladesh':'Asia','bhutan':'Asia','brunei darussalam':'Asia','cambodia':'Asia',
+    'china':'Asia','cyprus':'Asia','georgia':'Asia','india':'Asia','indonesia':'Asia',
+    'iran':'Asia','iran (islamic republic of)':'Asia','iraq':'Asia','israel':'Asia',
+    'japan':'Asia','jordan':'Asia','kazakhstan':'Asia','korea (republic of)':'Asia',
+    "korea (democratic people's rep. of)":'Asia','kuwait':'Asia','kyrgyzstan':'Asia',
+    "lao people's democratic republic":'Asia','laos':'Asia','lebanon':'Asia',
+    'malaysia':'Asia','maldives':'Asia','mongolia':'Asia','myanmar':'Asia','nepal':'Asia',
+    'oman':'Asia','pakistan':'Asia','state of palestine':'Asia','palestine':'Asia',
+    'philippines':'Asia','qatar':'Asia','saudi arabia':'Asia','singapore':'Asia',
+    'sri lanka':'Asia','syrian arab republic':'Asia','tajikistan':'Asia','thailand':'Asia',
+    'timor-leste':'Asia','turkey':'Asia','türkiye':'Asia','turkmenistan':'Asia',
+    'united arab emirates':'Asia','uzbekistan':'Asia','viet nam':'Asia','vietnam':'Asia',
+    'yemen':'Asia',
+    'albania':'Europe','austria':'Europe','belarus':'Europe','belgium':'Europe',
+    'bosnia and herzegovina':'Europe','bulgaria':'Europe','croatia':'Europe',
+    'czechia':'Europe','czech republic':'Europe','denmark':'Europe','estonia':'Europe',
+    'finland':'Europe','france':'Europe','germany':'Europe','greece':'Europe',
+    'hungary':'Europe','iceland':'Europe','ireland':'Europe','italy':'Europe',
+    'latvia':'Europe','liechtenstein':'Europe','lithuania':'Europe','luxembourg':'Europe',
+    'malta':'Europe','moldova':'Europe','moldova (republic of)':'Europe','monaco':'Europe',
+    'montenegro':'Europe','netherlands':'Europe','north macedonia':'Europe','norway':'Europe',
+    'poland':'Europe','portugal':'Europe','romania':'Europe','russia':'Europe',
+    'russian federation':'Europe','serbia':'Europe','slovakia':'Europe','slovenia':'Europe',
+    'spain':'Europe','sweden':'Europe','switzerland':'Europe','ukraine':'Europe',
+    'united kingdom':'Europe',
+    'antigua and barbuda':'Americas','argentina':'Americas','bahamas':'Americas',
+    'barbados':'Americas','belize':'Americas','bolivia':'Americas',
+    'bolivia (plurinational state of)':'Americas','brazil':'Americas','canada':'Americas',
+    'chile':'Americas','colombia':'Americas','costa rica':'Americas','cuba':'Americas',
+    'dominican republic':'Americas','ecuador':'Americas','el salvador':'Americas',
+    'guatemala':'Americas','guyana':'Americas','haiti':'Americas','honduras':'Americas',
+    'jamaica':'Americas','mexico':'Americas','nicaragua':'Americas','panama':'Americas',
+    'paraguay':'Americas','peru':'Americas','suriname':'Americas',
+    'trinidad and tobago':'Americas','united states':'Americas',
+    'united states of america':'Americas','uruguay':'Americas',
+    'venezuela':'Americas','venezuela (bolivarian republic of)':'Americas',
+    'australia':'Oceania','fiji':'Oceania','kiribati':'Oceania','new zealand':'Oceania',
+    'papua new guinea':'Oceania','samoa':'Oceania','solomon islands':'Oceania',
+    'tonga':'Oceania','vanuatu':'Oceania',
+}
+
+COUNTRY_COORDS = {
+    'afghanistan':(33.0,65.0),'albania':(41.0,20.0),'algeria':(28.0,3.0),
+    'angola':(-12.5,18.5),'argentina':(-34.0,-64.0),'armenia':(40.0,45.0),
+    'australia':(-25.0,135.0),'austria':(47.5,14.5),'azerbaijan':(40.5,47.5),
+    'bahamas':(24.25,-76.0),'bangladesh':(24.0,90.0),'belarus':(53.0,28.0),
+    'belgium':(50.5,4.5),'belize':(17.25,-88.75),'benin':(9.5,2.25),
+    'bhutan':(27.5,90.5),'bolivia (plurinational state of)':(-17.0,-65.0),
+    'bosnia and herzegovina':(44.0,18.0),'botswana':(-22.0,24.0),
+    'brazil':(-10.0,-55.0),'bulgaria':(43.0,25.0),'burkina faso':(13.0,-2.0),
+    'burundi':(-3.5,30.0),'cabo verde':(16.0,-24.0),'cambodia':(13.0,105.0),
+    'cameroon':(6.0,12.0),'canada':(60.0,-95.0),'central african republic':(7.0,21.0),
+    'chad':(15.0,19.0),'chile':(-30.0,-71.0),'china':(35.0,105.0),
+    'colombia':(4.0,-72.0),'congo':(-1.0,15.0),
+    'congo (democratic republic of the)':(-4.0,23.0),'costa rica':(10.0,-84.0),
+    "côte d'ivoire":(8.0,-5.0),'croatia':(45.0,16.0),'cuba':(21.5,-80.0),
+    'cyprus':(35.0,33.0),'czechia':(49.75,15.5),'denmark':(56.0,10.0),
+    'djibouti':(11.5,43.0),'dominican republic':(19.0,-70.5),
+    'ecuador':(-2.0,-77.5),'egypt':(27.0,30.0),'el salvador':(13.83,-88.92),
+    'eritrea':(15.0,39.0),'estonia':(59.0,26.0),'eswatini (kingdom of)':(-26.5,31.5),
+    'ethiopia':(8.0,38.0),'fiji':(-17.71,178.06),'finland':(64.0,26.0),
+    'france':(46.0,2.0),'gabon':(-1.0,11.75),'gambia':(13.5,-15.5),
+    'georgia':(42.0,43.5),'germany':(51.0,9.0),'ghana':(8.0,-2.0),
+    'greece':(39.0,22.0),'guatemala':(15.5,-90.25),'guinea':(11.0,-10.0),
+    'guinea-bissau':(12.0,-15.0),'guyana':(5.0,-59.0),'haiti':(19.0,-72.42),
+    'honduras':(15.0,-86.5),'hungary':(47.0,20.0),'iceland':(65.0,-18.0),
+    'india':(20.0,77.0),'indonesia':(-5.0,120.0),'iran (islamic republic of)':(32.0,53.0),
+    'iraq':(33.0,44.0),'ireland':(53.0,-8.0),'israel':(31.5,34.75),
+    'italy':(42.83,12.83),'jamaica':(18.25,-77.5),'japan':(36.0,138.0),
+    'jordan':(31.0,36.0),'kazakhstan':(48.0,68.0),'kenya':(1.0,38.0),
+    'korea (republic of)':(37.0,127.5),"korea (democratic people's rep. of)":(40.0,127.0),
+    'kyrgyzstan':(41.0,75.0),"lao people's democratic republic":(18.0,105.0),
+    'latvia':(57.0,25.0),'lebanon':(33.83,35.83),'lesotho':(-29.5,28.5),
+    'liberia':(6.5,-9.5),'libya':(25.0,17.0),'lithuania':(56.0,24.0),
+    'luxembourg':(49.75,6.17),'madagascar':(-20.0,47.0),'malawi':(-13.5,34.0),
+    'malaysia':(2.5,112.5),'maldives':(3.2,73.0),'mali':(17.0,-4.0),
+    'mauritania':(20.0,-12.0),'mauritius':(-20.28,57.58),'mexico':(23.0,-102.0),
+    'moldova (republic of)':(47.0,29.0),'mongolia':(46.0,105.0),
+    'montenegro':(42.5,19.3),'morocco':(32.0,-5.0),'mozambique':(-18.25,35.0),
+    'myanmar':(22.0,98.0),'namibia':(-22.0,17.0),'nepal':(28.0,84.0),
+    'netherlands':(52.5,5.75),'new zealand':(-41.0,174.0),'nicaragua':(13.0,-85.0),
+    'niger':(16.0,8.0),'nigeria':(10.0,8.0),'north macedonia':(41.83,22.0),
+    'norway':(62.0,10.0),'pakistan':(30.0,70.0),'panama':(9.0,-80.0),
+    'papua new guinea':(-6.0,147.0),'paraguay':(-23.0,-58.0),'peru':(-10.0,-76.0),
+    'philippines':(13.0,122.0),'poland':(52.0,20.0),'portugal':(39.5,-8.0),
+    'romania':(46.0,25.0),'russian federation':(60.0,100.0),'rwanda':(-2.0,30.0),
+    'saudi arabia':(25.0,45.0),'senegal':(14.0,-14.0),'serbia':(44.0,21.0),
+    'sierra leone':(8.5,-11.5),'singapore':(1.37,103.8),'slovakia':(48.67,19.5),
+    'slovenia':(46.0,15.0),'somalia':(10.0,49.0),'south africa':(-29.0,24.0),
+    'south sudan':(8.0,30.0),'spain':(40.0,-4.0),'sri lanka':(7.0,81.0),
+    'state of palestine':(32.0,35.25),'sudan':(15.0,30.0),'sweden':(62.0,15.0),
+    'switzerland':(47.0,8.0),'syrian arab republic':(35.0,38.0),
+    'tajikistan':(39.0,71.0),'tanzania (united republic of)':(-6.0,35.0),
+    'thailand':(15.0,100.0),'timor-leste':(-8.83,125.92),'togo':(8.0,1.17),
+    'tunisia':(34.0,9.0),'türkiye':(39.0,35.0),'turkmenistan':(40.0,60.0),
+    'uganda':(1.0,32.0),'ukraine':(49.0,32.0),'united kingdom':(54.0,-2.0),
+    'united states':(38.0,-97.0),'uruguay':(-33.0,-56.0),'uzbekistan':(41.0,64.0),
+    'venezuela (bolivarian republic of)':(8.0,-66.0),'viet nam':(16.0,106.0),
+    'yemen':(15.5,48.0),'zambia':(-13.0,27.5),'zimbabwe':(-20.0,30.0),
+}
+
+# Country-name aliases to canonical HDI names (union of all dataset mappings)
+ALIASES = {
+    'north korea':"korea (democratic people's rep. of)",
+    'south korea':'korea (republic of)',
+    'iran':'iran (islamic republic of)',
+    'syria':'syrian arab republic',
+    'vietnam':'viet nam',
+    'laos':"lao people's democratic republic",
+    'congo-kinshasa':'congo (democratic republic of the)',
+    'congo-brazzaville':'congo',
+    'ivory coast':"côte d'ivoire","cote d'ivoire":"côte d'ivoire",
+    'the gambia':'gambia','czech republic':'czechia','slovak republic':'slovakia',
+    'macedonia':'north macedonia','turkey':'türkiye','russia':'russian federation',
+    'east timor':'timor-leste','burma':'myanmar','cape verde':'cabo verde',
+    'somaliland':'somalia','tanzania':'tanzania (united republic of)',
+    'bolivia':'bolivia (plurinational state of)',
+    'venezuela':'venezuela (bolivarian republic of)',
+    'moldova':'moldova (republic of)','eswatini':'eswatini (kingdom of)',
+    'palestine':'state of palestine',
+    'dem rep of the congo':'congo (democratic republic of the)',
+    'rep of the congo':'congo','korea, south':'korea (republic of)',
+    "korea, north":"korea (democratic people's rep. of)",
+    'central african rep':'central african republic',
+    'central african rep.':'central african republic',
+}
+
+# ── Index definitions ─────────────────────────────────────────────────────────
+INDICES = {
+    'gpm_precip': {
+        'label'   : 'Precipitation Trend',
+        'units'   : 'mm/yr',
+        'icon'    : '🌧️',
+        'source'  : 'NASA GPM IMERG',
+        'file'    : 'GPM_Precip_Trend_By_Country.csv',
+        'kind'    : 'csv',
+        'country_col': 'country_name',
+        'trend_col'  : 'precip_trend_mm_per_year',
+        'pos_good': True,   # True = positive trend is generally "good"
+    },
+    'grace_water': {
+        'label'   : 'Water Storage Trend',
+        'units'   : 'cm/yr',
+        'icon'    : '💧',
+        'source'  : 'NASA GRACE / GRACE-FO',
+        'file'    : 'GRACE_TWS_Trend_By_Country_Global.csv',
+        'kind'    : 'csv',
+        'country_col': 'country_na',
+        'trend_col'  : 'trend_cm_per_year',
+        'pos_good': True,
+    },
+    'pm25': {
+        'label'   : 'PM2.5 Trend',
+        'units'   : 'µg/m³/yr',
+        'icon'    : '💨',
+        'source'  : 'Global Satellite PM2.5 (GEE)',
+        'file'    : 'PM25_Monthly_Trend_By_Country.csv',
+        'kind'    : 'csv',
+        'country_col': 'country_name',
+        'trend_col'  : 'pm25_trend_ug_m3_per_year',
+        'pos_good': False,  # more PM2.5 = bad
+    },
+    'giss_temp': {
+        'label'   : 'Surface Temperature Trend',
+        'units'   : '°C/decade',
+        'icon'    : '🌡️',
+        'source'  : 'NASA GISTEMP',
+        'file'    : 'GISS_temperature_trend_1980_2025.nc',
+        'kind'    : 'netcdf',
+        'pos_good': False,
+    },
+    'ssp245_temp': {
+        'label'   : 'Future Temp Trend (SSP2-4.5)',
+        'units'   : '°C/yr',
+        'icon'    : '🔮',
+        'source'  : 'CMIP6 SSP2-4.5',
+        'file'    : 'tas_slope_ssp245.tif',
+        'kind'    : 'tif',
+        'pos_good': False,
+    },
+    'ssp585_temp': {
+        'label'   : 'Future Temp Trend (SSP5-8.5)',
+        'units'   : '°C/yr',
+        'icon'    : '🔮',
+        'source'  : 'CMIP6 SSP5-8.5',
+        'file'    : 'tas_slope_ssp585.tif',
+        'kind'    : 'tif',
+        'pos_good': False,
+    },
+    'ssp245_precip': {
+        'label'   : 'Future Precip Trend (SSP2-4.5)',
+        'units'   : 'mm/day/yr',
+        'icon'    : '🌦️',
+        'source'  : 'CMIP6 SSP2-4.5',
+        'file'    : 'pr_slope_ssp245.tif',
+        'kind'    : 'tif',
+        'pos_good': True,
+    },
+    'ssp585_precip': {
+        'label'   : 'Future Precip Trend (SSP5-8.5)',
+        'units'   : 'mm/day/yr',
+        'icon'    : '🌦️',
+        'source'  : 'CMIP6 SSP5-8.5',
+        'file'    : 'pr_slope_ssp585.tif',
+        'kind'    : 'tif',
+        'pos_good': True,
+    },
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Data loading helpers (cached)
+# ═══════════════════════════════════════════════════════════════════════════════
+@st.cache_data
+def load_hdi():
+    df = pd.read_csv('HDR25_Statistical_Annex_HDI_Table.csv', skiprows=3)
+    df.columns = df.columns.str.strip()
+    country_col = 'Country' if 'Country' in df.columns else df.columns[1]
+    value_col   = df.columns[2]
+    df[country_col] = df[country_col].str.strip()
+    df[value_col]   = pd.to_numeric(df[value_col], errors='coerce')
+    df = df.dropna(subset=[country_col, value_col])
+    return dict(zip(df[country_col].str.lower(), df[value_col]))
+
+
+@st.cache_data
+def load_csv_index(filepath, country_col, trend_col):
+    """Load a CSV-based index, return {country_lower: (value, global_mean)}."""
+    import os
+    if not os.path.exists(filepath):
+        return None, None
+    df = pd.read_csv(filepath)
+    df[country_col] = df[country_col].str.strip().str.lower()
+    df = df.drop_duplicates(subset=country_col)
+    df[trend_col] = pd.to_numeric(df[trend_col], errors='coerce')
+    df = df.dropna(subset=[trend_col])
+    lookup = dict(zip(df[country_col], df[trend_col]))
+    global_mean = float(df[trend_col].mean())
+    return lookup, global_mean
+
+
+@st.cache_data
+def load_giss_index():
+    """Load GISTEMP NetCDF, return {country_lower: value} and global mean."""
+    import os
+    if not os.path.exists('GISS_temperature_trend_1980_2025.nc'):
+        return None, None
+    try:
+        import netCDF4 as nc
+    except ImportError:
+        return None, None
+    ds   = nc.Dataset('GISS_temperature_trend_1980_2025.nc', 'r')
+    lat  = ds.variables['lat'][:]
+    lon  = ds.variables['lon'][:]
+    data = ds.variables['TEMPTREND'][:]
+    miss = ds.variables['TEMPTREND'].missing_value
+    ds.close()
+
+    def sample(lat_c, lon_c, window=3):
+        li = np.abs(lat - lat_c).argmin()
+        lj = np.abs(lon - lon_c).argmin()
+        chunk = data[max(0,li-window):li+window+1,
+                     max(0,lj-window):lj+window+1]
+        valid = chunk[chunk != miss]
+        return float(np.mean(valid)) if len(valid) > 0 else np.nan
+
+    lookup = {}
+    vals   = []
+    for c_lower, coords in COUNTRY_COORDS.items():
+        v = sample(*coords)
+        if not np.isnan(v):
+            lookup[c_lower] = v
+            vals.append(v)
+    global_mean = float(np.mean(vals)) if vals else np.nan
+    return lookup, global_mean
+
+
+@st.cache_data
+def load_tif_index(filepath):
+    """Sample a GeoTIFF at every country centroid. Return lookup + global mean."""
+    import os
+    if not os.path.exists(filepath) or not HAS_RASTERIO:
+        return None, None
+    try:
+        with rasterio.open(filepath) as src:
+            nodata = src.nodata
+            lookup = {}
+            vals   = []
+            for c_lower, (lat_c, lon_c) in COUNTRY_COORDS.items():
+                try:
+                    row, col = src.index(lon_c, lat_c)
+                    h, w = src.height, src.width
+                    r0 = max(0, row-2); r1 = min(h, row+3)
+                    c0 = max(0, col-2); c1 = min(w, col+3)
+                    patch = src.read(1, window=rasterio.windows.Window(
+                        c0, r0, c1-c0, r1-r0)).astype(float)
+                    if nodata is not None:
+                        patch = np.where(patch == nodata, np.nan, patch)
+                    patch = np.where(np.abs(patch) > 1e10, np.nan, patch)
+                    valid = patch[~np.isnan(patch)]
+                    if len(valid) > 0:
+                        v = float(np.mean(valid))
+                        lookup[c_lower] = v
+                        vals.append(v)
+                except Exception:
+                    continue
+        global_mean = float(np.mean(vals)) if vals else np.nan
+        return lookup, global_mean
+    except Exception:
+        return None, None
+
+
+def resolve_country(raw_name):
+    """Resolve a display name to its canonical lower-case HDI key."""
+    lower = raw_name.strip().lower()
+    return ALIASES.get(lower, lower)
+
+
+def get_all_indices(canonical_lower):
+    """Return a dict of key → (value, global_mean) for all indices."""
+    results = {}
+
+    # CSV-based indices
+    for key, meta in INDICES.items():
+        if meta['kind'] != 'csv':
+            continue
+        lookup, gmean = load_csv_index(meta['file'], meta['country_col'], meta['trend_col'])
+        if lookup is None:
+            results[key] = (None, None)
+            continue
+        # Try direct match, then alias
+        val = lookup.get(canonical_lower)
+        if val is None:
+            val = lookup.get(ALIASES.get(canonical_lower, ''))
+        results[key] = (val, gmean)
+
+    # GISTEMP
+    lookup_giss, gmean_giss = load_giss_index()
+    if lookup_giss is not None:
+        val = lookup_giss.get(canonical_lower)
+        results['giss_temp'] = (val, gmean_giss)
+    else:
+        results['giss_temp'] = (None, None)
+
+    # GeoTIFF indices
+    for key, meta in INDICES.items():
+        if meta['kind'] != 'tif':
+            continue
+        lookup_tif, gmean_tif = load_tif_index(meta['file'])
+        if lookup_tif is None:
+            results[key] = (None, None)
+            continue
+        val = lookup_tif.get(canonical_lower)
+        results[key] = (val, gmean_tif)
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sidebar — navigation + country selector
+# ═══════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.page_link("landing_page.py",         label="Home",                 icon="🏠")
+    st.page_link("pages/1_HDI_Climate.py",  label="Comparative Analysis", icon="🌍")
+    st.page_link("pages/2_GPM_Map.py",      label="Precipitation",        icon="🌧️")
+    st.page_link("pages/3_GRACE_Map.py",    label="Water Storage",        icon="💧")
+    st.page_link("pages/4_PM25_Map.py",     label="Air Quality",          icon="💨")
+    st.page_link("pages/5_GISStemp_Map.py", label="Temperature",          icon="🌡️")
+    st.page_link("pages/6_Temp_SSP.py",     label="Future Temperature",   icon="🔮")
+    st.page_link("pages/7_Precip_SSP.py",   label="Future Precipitation", icon="🌦️")
+    st.page_link("pages/8_Country_Profile.py", label="Country Profile",   icon="🔎")
+
+    st.markdown("---")
+    st.markdown(
+        "<div style='font-size:0.76rem;color:#4a7a8a;'>"
+        "Source: NASA GPM · GRACE · GISTEMP · CMIP6 · UNDP HDI 2025"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Page header
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown("# 🔎 Country Profile")
+st.markdown(
+    "<span style='font-family:IBM Plex Mono;font-size:12px;color:#8b949e;'>"
+    "All environmental stress indices for a selected country &nbsp;·&nbsp; "
+    "observed &amp; projected &nbsp;·&nbsp; vs global mean"
+    "</span>",
+    unsafe_allow_html=True,
+)
+st.markdown("---")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Country selector
+# ═══════════════════════════════════════════════════════════════════════════════
+# Build display list from COUNTRY_COORDS keys (these are canonical lower-case)
+display_names = sorted([c.title() for c in COUNTRY_COORDS.keys()])
+
+col_sel, col_gap = st.columns([1, 2])
+with col_sel:
+    selected_display = st.selectbox(
+        "Choose a country",
+        options=display_names,
+        index=display_names.index("India") if "India" in display_names else 0,
+    )
+
+canonical = resolve_country(selected_display)
+coords    = COUNTRY_COORDS.get(canonical)
+continent = CONTINENT_MAPPING.get(canonical, "Unknown")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Load HDI
+# ═══════════════════════════════════════════════════════════════════════════════
+with st.spinner("Loading data…"):
+    hdi_lookup = load_hdi()
+    hdi_val    = hdi_lookup.get(canonical)
+
+    if hdi_val is None:
+        # Try aliases
+        for alias, canon in ALIASES.items():
+            if canon == canonical:
+                hdi_val = hdi_lookup.get(alias)
+                if hdi_val:
+                    break
+
+    # HDI tier
+    if hdi_val is not None:
+        if   hdi_val >= 0.800: tier, tier_color, tier_bg = "Very High", "#3498db", "rgba(52,152,219,0.15)"
+        elif hdi_val >= 0.700: tier, tier_color, tier_bg = "High",      "#2ecc71", "rgba(46,204,113,0.15)"
+        elif hdi_val >= 0.550: tier, tier_color, tier_bg = "Medium",    "#f39c12", "rgba(243,156,18,0.15)"
+        else:                  tier, tier_color, tier_bg = "Low",       "#e74c3c", "rgba(231,76,60,0.15)"
+    else:
+        tier, tier_color, tier_bg = "—", "#8b949e", "rgba(139,148,158,0.15)"
+
+    # All environmental indices
+    index_results = get_all_indices(canonical)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hero banner
+# ═══════════════════════════════════════════════════════════════════════════════
+lat_str = f"{abs(coords[0]):.1f}°{'N' if coords[0]>=0 else 'S'}" if coords else "—"
+lon_str = f"{abs(coords[1]):.1f}°{'E' if coords[1]>=0 else 'W'}" if coords else "—"
+
+st.markdown(
+    f"""
+    <div class="hero-banner">
+        <div style="display:flex;align-items:flex-start;flex-wrap:wrap;gap:2.5rem;">
+            <div>
+                <div style="font-size:0.72rem;color:#8b949e;letter-spacing:0.12em;
+                            text-transform:uppercase;margin-bottom:4px;">Country</div>
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:2rem;
+                            font-weight:600;color:#e8e8e8;line-height:1;">
+                    {selected_display}
+                </div>
+                <div style="font-size:0.85rem;color:#7ec8d8;margin-top:6px;">
+                    {continent} &nbsp;·&nbsp; {lat_str}, {lon_str}
+                </div>
+            </div>
+
+            <div style="border-left:1px solid #30363d;padding-left:2.5rem;">
+                <div style="font-size:0.72rem;color:#8b949e;letter-spacing:0.12em;
+                            text-transform:uppercase;margin-bottom:4px;">HDI 2022</div>
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:2rem;
+                            font-weight:600;color:{tier_color};">
+                    {f"{hdi_val:.3f}" if hdi_val else "—"}
+                </div>
+                <div style="display:inline-block;font-size:0.75rem;padding:3px 12px;
+                            border-radius:20px;background:{tier_bg};color:{tier_color};
+                            border:1px solid {tier_color}44;margin-top:4px;">
+                    {tier} Human Development
+                </div>
+            </div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Index cards — Observed
+# ═══════════════════════════════════════════════════════════════════════════════
+def render_card(col, key, val, gmean, meta):
+    """Render one index card in the given column."""
+    label    = meta['label']
+    units    = meta['units']
+    icon     = meta['icon']
+    source   = meta['source']
+    pos_good = meta['pos_good']
+
+    with col:
+        if val is None:
+            st.markdown(
+                f"""
+                <div class="index-card">
+                    <div class="ic-label">{icon} {label}</div>
+                    <div class="ic-value" style="color:#4a7a8a;">—</div>
+                    <div class="ic-units">Data not available</div>
+                    <div class="ic-source">{source}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            return
+
+        val_color = "#00e5cc" if val > 0 else "#f85149"
+
+        if gmean is not None:
+            delta    = val - gmean
+            pct      = (delta / abs(gmean) * 100) if gmean != 0 else 0
+            arrow    = "▲" if delta >= 0 else "▼"
+            # Assess if above-global is "good" or "bad" for this index
+            is_good  = (delta >= 0) == pos_good
+            d_color  = "#2ecc71" if is_good else "#e74c3c"
+            delta_str = f"{arrow} {abs(pct):.1f}% vs global mean ({gmean:+.4f} {units})"
+        else:
+            delta_str = ""
+            d_color   = "#8b949e"
+
+        st.markdown(
+            f"""
+            <div class="index-card">
+                <div class="ic-label">{icon} {label}</div>
+                <div class="ic-value" style="color:{val_color};">{val:+.4f}</div>
+                <div class="ic-delta" style="color:{d_color};">{delta_str}</div>
+                <div class="ic-units">{units}</div>
+                <div class="ic-source">{source}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+st.markdown('<div class="section-header">📡 Observed Trends</div>', unsafe_allow_html=True)
+obs_keys = ['gpm_precip', 'grace_water', 'pm25', 'giss_temp']
+obs_cols = st.columns(4)
+for col, key in zip(obs_cols, obs_keys):
+    val, gmean = index_results.get(key, (None, None))
+    render_card(col, key, val, gmean, INDICES[key])
+
+st.markdown('<div class="section-header">🔭 CMIP6 Future Projections</div>', unsafe_allow_html=True)
+fut_keys = ['ssp245_temp', 'ssp585_temp', 'ssp245_precip', 'ssp585_precip']
+fut_cols = st.columns(4)
+for col, key in zip(fut_cols, fut_keys):
+    val, gmean = index_results.get(key, (None, None))
+    render_card(col, key, val, gmean, INDICES[key])
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Comparison bar chart — country vs global mean (% deviation)
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown('<div class="section-header">📊 Deviation from Global Mean</div>', unsafe_allow_html=True)
+
+chart_labels, chart_vals, chart_colors, chart_hover = [], [], [], []
+for key in obs_keys + fut_keys:
+    val, gmean = index_results.get(key, (None, None))
+    if val is None or gmean is None or gmean == 0:
+        continue
+    pct      = (val - gmean) / abs(gmean) * 100
+    pos_good = INDICES[key]['pos_good']
+    is_good  = (pct >= 0) == pos_good
+    color    = "#2ecc71" if is_good else "#e74c3c"
+    chart_labels.append(INDICES[key]['label'])
+    chart_vals.append(pct)
+    chart_colors.append(color)
+    chart_hover.append(
+        f"{INDICES[key]['label']}<br>"
+        f"Country: {val:+.5f} {INDICES[key]['units']}<br>"
+        f"Global mean: {gmean:+.5f} {INDICES[key]['units']}<br>"
+        f"Deviation: {pct:+.2f}%"
+    )
+
+if chart_labels:
+    fig = go.Figure(go.Bar(
+        x             = chart_labels,
+        y             = chart_vals,
+        marker_color  = chart_colors,
+        marker_line_width = 0,
+        customdata    = chart_hover,
+        hovertemplate = "%{customdata}<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_color="#8b949e", line_dash="dash", line_width=1)
+    fig.update_layout(
+        xaxis = dict(color="#8b949e", tickfont=dict(size=10), tickangle=15),
+        yaxis = dict(title="% deviation from global mean", color="#8b949e",
+                     tickfont=dict(size=10), gridcolor="#21262d"),
+        paper_bgcolor="#0f1117",
+        plot_bgcolor="#161b22",
+        height=340,
+        margin=dict(l=60, r=20, t=10, b=100),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Green = favourable direction relative to global mean (e.g. less PM2.5, more water storage). "
+        "Red = unfavourable. Bars show % deviation from the global country-mean for each index."
+    )
+else:
+    st.info("No index data available for this country. Check that all data files are present.")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Summary table
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown('<div class="section-header">📋 Full Summary Table</div>', unsafe_allow_html=True)
+
+rows = []
+for key in obs_keys + fut_keys:
+    val, gmean = index_results.get(key, (None, None))
+    m = INDICES[key]
+    pct_str = ""
+    if val is not None and gmean is not None and gmean != 0:
+        pct = (val - gmean) / abs(gmean) * 100
+        pct_str = f"{pct:+.2f}%"
+    rows.append({
+        "Index"           : f"{m['icon']} {m['label']}",
+        "Value"           : f"{val:+.5f}" if val is not None else "—",
+        "Units"           : m['units'],
+        "Global Mean"     : f"{gmean:+.5f}" if gmean is not None else "—",
+        "vs Global Mean"  : pct_str,
+        "Source"          : m['source'],
+    })
+
+summary_df = pd.DataFrame(rows)
+st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+st.download_button(
+    label     = f"⬇️ Download {selected_display} profile as CSV",
+    data      = summary_df.to_csv(index=False).encode("utf-8"),
+    file_name = f"country_profile_{canonical.replace(' ','_')}.csv",
+    mime      = "text/csv",
+)

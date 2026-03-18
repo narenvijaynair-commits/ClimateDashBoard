@@ -1,0 +1,1146 @@
+"""
+HDI vs GPM IMERG Precipitation Trend Dashboard
+===============================================
+Interactive analysis of the relationship between Human Development Index (HDI)
+and long-term precipitation trends derived from NASA GPM IMERG (2001-2023).
+
+Install:
+    pip install streamlit plotly rasterio numpy pandas matplotlib scipy
+
+Run (standalone):
+    streamlit run 6_HDI_vs_GPM_Precipitation.py
+
+As a multi-page app, place in pages/ next to landing_page.py.
+
+Required input file (same directory as the main app):
+    - GPM_IMERG_Precipitation_Trend_2001_2023.tif
+
+HDI data (2022) is embedded directly from UNDP Human Development Report 2023.
+"""
+
+import streamlit as st
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import plotly.graph_objects as go
+import plotly.express as px
+from pathlib import Path
+import io
+import warnings
+warnings.filterwarnings("ignore")
+
+# ── optional heavy imports ────────────────────────────────────────────────────
+try:
+    import rasterio
+    HAS_RASTERIO = True
+except ImportError:
+    HAS_RASTERIO = False
+
+try:
+    from scipy import ndimage, stats
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Page config
+# ═══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="HDI × GPM Precipitation Trend",
+    page_icon="🌧️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── custom CSS (dark theme) ───────────────────────────────────────────────────
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
+
+    html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
+    .stApp { background: #0f1117; color: #e8e8e8; }
+
+    section[data-testid="stSidebar"] {
+        background: #161b22;
+        border-right: 1px solid #30363d;
+    }
+
+    .section-header {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 11px;
+        color: #8b949e;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        border-bottom: 1px solid #30363d;
+        padding-bottom: 8px;
+        margin: 24px 0 16px 0;
+    }
+
+    h1 { font-family: 'IBM Plex Mono', monospace !important; font-size: 24px !important;
+         color: #e8e8e8 !important; letter-spacing: -0.5px; }
+    h2, h3 { font-family: 'IBM Plex Sans', sans-serif !important; color: #e8e8e8 !important; }
+
+    .stTabs [data-baseweb="tab-list"] { background: #161b22; border-bottom: 1px solid #30363d; gap: 0; }
+    .stTabs [data-baseweb="tab"] {
+        font-family: 'IBM Plex Mono', monospace;
+        font-size: 12px;
+        color: #8b949e;
+        border-bottom: 2px solid transparent;
+        padding: 10px 20px;
+    }
+    .stTabs [aria-selected="true"] { color: #58a6ff !important; border-bottom-color: #58a6ff !important; }
+
+    .stSlider > div > div > div { background: #30363d; }
+    .stSelectbox > div > div { background: #161b22; border-color: #30363d; }
+
+    div[data-testid="stMetric"] {
+        background: #161b22;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 12px 16px;
+    }
+    div[data-testid="stMetric"] label { color: #8b949e !important; font-size: 12px !important; }
+    div[data-testid="stMetric"] div[data-testid="stMetricValue"] { color: #e8e8e8 !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════════════════════════════
+TIFF_FILE = "GPM_IMERG_Precipitation_Trend_2001_2023.tif"
+
+COLORMAPS = {
+    "BrBG (Diverging)"   : "BrBG",
+    "RdBu (Diverging)"   : "RdBu",
+    "RdYlGn (Diverging)" : "RdYlGn",
+    "Coolwarm"           : "coolwarm",
+    "PuOr"               : "PuOr",
+    "PRGn"               : "PRGn",
+    "Viridis"            : "viridis",
+    "Blues"              : "Blues",
+    "YlGnBu"             : "YlGnBu",
+    "Turbo"              : "turbo",
+}
+
+REGIONS = {
+    "Global"         : (-180, -60, 180, 75),
+    "South Asia"     : (60,    5,  100, 40),
+    "East Asia"      : (100,  15,  145, 55),
+    "Southeast Asia" : (95,  -10,  141, 28),
+    "Middle East"    : (25,   15,   65, 42),
+    "Central Asia"   : (50,   35,   90, 55),
+    "Africa"         : (-20,  -40,   55, 38),
+    "Europe"         : (-25,   35,   45, 72),
+    "North America"  : (-170,  15,  -50, 75),
+    "South America"  : (-82,  -60,  -30, 15),
+    "Australia"      : (110,  -45,  155, -10),
+}
+
+# Region colour palette for scatter plots
+REGION_COLORS = {
+    "Sub-Saharan Africa" : "#e67e22",
+    "South Asia"         : "#e74c3c",
+    "East Asia"          : "#c0392b",
+    "Southeast Asia"     : "#f39c12",
+    "Middle East & N. Africa": "#d4ac0d",
+    "Central Asia"       : "#a04000",
+    "Europe"             : "#2980b9",
+    "North America"      : "#1abc9c",
+    "Latin America"      : "#27ae60",
+    "Oceania"            : "#8e44ad",
+}
+
+HDI_TIERS = {
+    "Very High (≥0.800)" : (0.800, 1.000),
+    "High (0.700–0.799)" : (0.700, 0.800),
+    "Medium (0.550–0.699)": (0.550, 0.700),
+    "Low (<0.550)"       : (0.000, 0.550),
+}
+
+HDI_TIER_COLORS = {
+    "Very High (≥0.800)" : "#3498db",
+    "High (0.700–0.799)" : "#2ecc71",
+    "Medium (0.550–0.699)": "#f39c12",
+    "Low (<0.550)"       : "#e74c3c",
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Embedded HDI data (UNDP HDR 2023 — HDI 2022 values)
+# Columns: country, hdi, region, lat (centroid), lon (centroid)
+# ═══════════════════════════════════════════════════════════════════════════════
+_HDI_RAW = [
+    # Very High HDI
+    ("Switzerland",         0.962, "Europe",               46.8,   8.2),
+    ("Norway",              0.966, "Europe",               64.5,  17.5),
+    ("Iceland",             0.959, "Europe",               65.0, -18.0),
+    ("Hong Kong",           0.956, "East Asia",            22.4, 114.1),
+    ("Denmark",             0.952, "Europe",               56.0,  10.0),
+    ("Sweden",              0.952, "Europe",               62.0,  16.0),
+    ("Germany",             0.950, "Europe",               51.2,  10.4),
+    ("Ireland",             0.950, "Europe",               53.4,  -8.2),
+    ("Singapore",           0.949, "Southeast Asia",        1.4, 103.8),
+    ("Australia",           0.946, "Oceania",             -25.3, 133.8),
+    ("Netherlands",         0.946, "Europe",               52.3,   5.3),
+    ("Finland",             0.942, "Europe",               64.0,  26.0),
+    ("United Kingdom",      0.940, "Europe",               54.7,  -3.4),
+    ("New Zealand",         0.939, "Oceania",             -40.9, 174.9),
+    ("Belgium",             0.942, "Europe",               50.8,   4.5),
+    ("Canada",              0.935, "North America",        60.0, -95.0),
+    ("Austria",             0.926, "Europe",               47.5,  14.5),
+    ("United States",       0.927, "North America",        38.9, -95.8),
+    ("Israel",              0.915, "Middle East & N. Africa", 31.5, 35.0),
+    ("Japan",               0.920, "East Asia",            36.2, 138.3),
+    ("South Korea",         0.929, "East Asia",            36.5, 127.9),
+    ("Luxembourg",          0.927, "Europe",               49.8,   6.1),
+    ("Slovenia",            0.926, "Europe",               46.1,  14.8),
+    ("Malta",               0.918, "Europe",               35.9,  14.4),
+    ("Estonia",             0.899, "Europe",               58.6,  25.0),
+    ("Czech Republic",      0.895, "Europe",               49.8,  15.5),
+    ("Greece",              0.893, "Europe",               39.1,  21.8),
+    ("Cyprus",              0.907, "Europe",               35.1,  33.4),
+    ("France",              0.910, "Europe",               46.2,   2.2),
+    ("UAE",                 0.937, "Middle East & N. Africa", 24.2, 53.9),
+    ("Bahrain",             0.888, "Middle East & N. Africa", 26.0, 50.6),
+    ("Spain",               0.911, "Europe",               40.5,  -3.7),
+    ("Italy",               0.906, "Europe",               42.8,  12.8),
+    ("Qatar",               0.855, "Middle East & N. Africa", 25.4, 51.2),
+    ("Lithuania",           0.879, "Europe",               55.9,  23.9),
+    ("Latvia",              0.879, "Europe",               56.9,  24.6),
+    ("Poland",              0.881, "Europe",               52.1,  19.4),
+    ("Portugal",            0.874, "Europe",               39.4,  -8.2),
+    ("Saudi Arabia",        0.875, "Middle East & N. Africa", 24.7, 45.1),
+    ("Kuwait",              0.847, "Middle East & N. Africa", 29.3, 47.5),
+    ("Slovakia",            0.855, "Europe",               48.7,  19.7),
+    ("Hungary",             0.851, "Europe",               47.2,  19.5),
+    ("Argentina",           0.849, "Latin America",       -34.0, -64.0),
+    ("Chile",               0.860, "Latin America",       -35.7, -71.5),
+    ("Montenegro",          0.844, "Europe",               42.7,  19.4),
+    ("Croatia",             0.878, "Europe",               45.1,  16.4),
+    ("Turkey",              0.855, "Middle East & N. Africa", 39.0, 35.2),
+    ("Oman",                0.816, "Middle East & N. Africa", 21.0, 57.0),
+    ("Russia",              0.821, "Europe",               64.7,  97.7),
+    ("Romania",             0.827, "Europe",               45.9,  24.9),
+    ("Belarus",             0.801, "Europe",               53.7,  28.0),
+    ("Kazakhstan",          0.802, "Central Asia",         48.0,  68.0),
+    ("Uruguay",             0.830, "Latin America",       -32.5, -55.8),
+    ("Bahamas",             0.820, "Latin America",        24.2, -76.0),
+    ("Panama",              0.818, "Latin America",         8.5, -80.2),
+    # High HDI
+    ("Malaysia",            0.803, "Southeast Asia",        4.2, 108.0),
+    ("Trinidad and Tobago", 0.814, "Latin America",        10.7, -61.2),
+    ("Georgia",             0.814, "Central Asia",         42.3,  43.4),
+    ("Sri Lanka",           0.780, "South Asia",            7.9,  80.7),
+    ("Serbia",              0.805, "Europe",               44.0,  21.0),
+    ("North Macedonia",     0.770, "Europe",               41.6,  21.7),
+    ("Brazil",              0.760, "Latin America",       -14.2, -51.9),
+    ("Thailand",            0.803, "Southeast Asia",       15.9, 100.9),
+    ("Jamaica",             0.706, "Latin America",        18.1, -77.3),
+    ("Colombia",            0.758, "Latin America",         4.6, -74.1),
+    ("Peru",                0.762, "Latin America",        -9.2, -75.0),
+    ("Ecuador",             0.765, "Latin America",        -1.8, -78.2),
+    ("China",               0.788, "East Asia",            35.9, 104.2),
+    ("Mexico",              0.781, "Latin America",        23.6, -102.6),
+    ("Dominican Republic",  0.767, "Latin America",        18.7, -70.2),
+    ("Venezuela",           0.698, "Latin America",         6.4, -66.6),
+    ("Azerbaijan",          0.760, "Central Asia",         40.1,  47.6),
+    ("Armenia",             0.791, "Central Asia",         40.1,  45.0),
+    ("Ukraine",             0.734, "Europe",               48.4,  31.2),
+    ("Moldova",             0.763, "Europe",               47.0,  28.4),
+    ("Costa Rica",          0.806, "Latin America",        10.0, -83.8),
+    ("Paraguay",            0.725, "Latin America",       -23.4, -58.4),
+    ("Jordan",              0.736, "Middle East & N. Africa", 31.2, 36.5),
+    ("Libya",               0.718, "Middle East & N. Africa", 26.3, 17.2),
+    ("Lebanon",             0.706, "Middle East & N. Africa", 33.9, 35.5),
+    ("Maldives",            0.762, "South Asia",            3.2,  73.2),
+    ("Indonesia",           0.713, "Southeast Asia",       -0.8, 113.9),
+    ("Philippines",         0.710, "Southeast Asia",       12.9, 121.8),
+    ("Suriname",            0.700, "Latin America",         3.9, -56.0),
+    ("Tunisia",             0.732, "Middle East & N. Africa", 33.9,   9.5),
+    ("Algeria",             0.745, "Middle East & N. Africa", 28.0,   2.6),
+    ("Egypt",               0.728, "Middle East & N. Africa", 26.8,  29.9),
+    ("Bosnia and Herz.",    0.779, "Europe",               44.2,  17.6),
+    ("Albania",             0.789, "Europe",               41.1,  20.2),
+    ("Iran",                0.780, "Middle East & N. Africa", 32.4, 53.7),
+    ("Botswana",            0.693, "Sub-Saharan Africa",  -22.3,  24.7),
+    ("South Africa",        0.717, "Sub-Saharan Africa",  -29.0,  25.1),
+    ("Gabon",               0.703, "Sub-Saharan Africa",   -0.8,  11.6),
+    ("Namibia",             0.615, "Sub-Saharan Africa",  -22.0,  17.0),
+    # Medium HDI
+    ("Bolivia",             0.698, "Latin America",       -16.7, -64.7),
+    ("Vietnam",             0.726, "Southeast Asia",       14.1, 108.3),
+    ("El Salvador",         0.675, "Latin America",        13.8, -88.9),
+    ("Morocco",             0.698, "Middle East & N. Africa", 31.8,  -7.1),
+    ("Cape Verde",          0.686, "Sub-Saharan Africa",   16.0, -24.0),
+    ("Guatemala",           0.633, "Latin America",        15.8, -90.2),
+    ("India",               0.644, "South Asia",           20.6,  79.0),
+    ("Uzbekistan",          0.727, "Central Asia",         41.4,  63.9),
+    ("Iraq",                0.686, "Middle East & N. Africa", 33.2, 43.7),
+    ("Mongolia",            0.743, "East Asia",            46.9, 103.8),
+    ("Kyrgyzstan",          0.700, "Central Asia",         41.2,  74.8),
+    ("Palestine",           0.714, "Middle East & N. Africa", 31.9, 35.3),
+    ("Honduras",            0.624, "Latin America",        15.2, -86.2),
+    ("Nepal",               0.601, "South Asia",           28.4,  84.1),
+    ("Bangladesh",          0.670, "South Asia",           23.7,  90.4),
+    ("Cambodia",            0.600, "Southeast Asia",       12.6, 104.9),
+    ("Myanmar",             0.585, "Southeast Asia",       17.2,  96.7),
+    ("Kenya",               0.601, "Sub-Saharan Africa",   -0.0,  37.9),
+    ("Ghana",               0.602, "Sub-Saharan Africa",    7.9,  -1.2),
+    ("Laos",                0.620, "Southeast Asia",       17.9, 102.5),
+    ("Pakistan",            0.544, "South Asia",           30.4,  69.3),
+    ("Eswatini",            0.597, "Sub-Saharan Africa",  -26.5,  31.5),
+    ("Angola",              0.586, "Sub-Saharan Africa",  -11.2,  17.9),
+    ("Tanzania",            0.532, "Sub-Saharan Africa",   -6.4,  34.9),
+    ("Cameroon",            0.587, "Sub-Saharan Africa",    5.7,  12.4),
+    ("Congo",               0.573, "Sub-Saharan Africa",   -0.2,  15.8),
+    ("Zambia",              0.565, "Sub-Saharan Africa",  -13.9,  27.8),
+    ("Côte d'Ivoire",       0.550, "Sub-Saharan Africa",    7.5,  -5.5),
+    ("Zimbabwe",            0.550, "Sub-Saharan Africa",  -19.0,  29.9),
+    ("DRC",                 0.481, "Sub-Saharan Africa",   -2.9,  23.7),
+    # Low HDI
+    ("Nigeria",             0.548, "Sub-Saharan Africa",    9.1,   8.7),
+    ("Uganda",              0.544, "Sub-Saharan Africa",    1.4,  32.3),
+    ("Ethiopia",            0.492, "Sub-Saharan Africa",    9.1,  40.5),
+    ("Rwanda",              0.534, "Sub-Saharan Africa",   -1.9,  29.9),
+    ("Senegal",             0.517, "Sub-Saharan Africa",   14.5, -14.5),
+    ("Sudan",               0.508, "Sub-Saharan Africa",   15.6,  31.5),
+    ("Haiti",               0.535, "Latin America",        18.9, -72.7),
+    ("Malawi",              0.508, "Sub-Saharan Africa",  -13.3,  34.3),
+    ("Mozambique",          0.461, "Sub-Saharan Africa",  -18.7,  35.5),
+    ("Burkina Faso",        0.449, "Sub-Saharan Africa",   12.4,  -1.6),
+    ("Guinea",              0.465, "Sub-Saharan Africa",   10.9, -10.9),
+    ("Benin",               0.525, "Sub-Saharan Africa",    9.3,   2.3),
+    ("Togo",                0.547, "Sub-Saharan Africa",    8.6,   0.8),
+    ("Mali",                0.410, "Sub-Saharan Africa",   17.6,  -2.0),
+    ("Madagascar",          0.476, "Sub-Saharan Africa",  -18.8,  46.9),
+    ("Guinea-Bissau",       0.461, "Sub-Saharan Africa",   11.8, -15.2),
+    ("Yemen",               0.424, "Middle East & N. Africa", 15.6, 48.5),
+    ("Niger",               0.394, "Sub-Saharan Africa",   17.6,   8.1),
+    ("Chad",                0.394, "Sub-Saharan Africa",   15.5,  18.7),
+    ("Liberia",             0.481, "Sub-Saharan Africa",    6.4,  -9.4),
+    ("Sierra Leone",        0.477, "Sub-Saharan Africa",    8.5, -11.8),
+    ("Central Afr. Rep.",   0.387, "Sub-Saharan Africa",    6.6,  20.5),
+    ("South Sudan",         0.381, "Sub-Saharan Africa",    7.0,  30.2),
+    ("Afghanistan",         0.462, "South Asia",           33.9,  67.7),
+    ("Papua New Guinea",    0.558, "Oceania",              -6.3, 143.9),
+    ("Timor-Leste",         0.607, "Southeast Asia",       -8.8, 125.7),
+    ("Solomon Islands",     0.570, "Oceania",              -9.7, 160.1),
+]
+
+HDI_DF = pd.DataFrame(
+    _HDI_RAW,
+    columns=["country", "hdi", "region", "lat", "lon"]
+)
+
+def get_hdi_tier(hdi_val):
+    for tier, (lo, hi) in HDI_TIERS.items():
+        if lo <= hdi_val <= hi:
+            return tier
+    return "Low (<0.550)"
+
+HDI_DF["tier"] = HDI_DF["hdi"].apply(get_hdi_tier)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Data loading
+# ═══════════════════════════════════════════════════════════════════════════════
+@st.cache_data(show_spinner="Loading GeoTIFF…")
+def load_tiff(path: str, downsample: int = 4):
+    if not HAS_RASTERIO:
+        return None
+    with rasterio.open(path) as src:
+        data = src.read(
+            1,
+            out_shape=(
+                max(1, src.height // downsample),
+                max(1, src.width  // downsample),
+            ),
+            resampling=rasterio.enums.Resampling.average,
+        ).astype(float)
+        bounds     = src.bounds
+        nodata     = src.nodata
+        crs        = str(src.crs)
+        orig_shape = (src.height, src.width)
+        res        = src.res
+
+    if nodata is not None:
+        data = np.where(data == nodata, np.nan, data)
+    data = np.where(np.abs(data) > 1e10, np.nan, data)
+
+    lons = np.linspace(bounds.left,  bounds.right,  data.shape[1])
+    lats = np.linspace(bounds.top,   bounds.bottom, data.shape[0])
+
+    return {
+        "data"       : data,
+        "lons"       : lons,
+        "lats"       : lats,
+        "bounds"     : bounds,
+        "crs"        : crs,
+        "orig_shape" : orig_shape,
+        "res"        : res,
+        "nodata"     : nodata,
+    }
+
+
+def crop_to_region(raster, region_bounds):
+    lon_min, lat_min, lon_max, lat_max = region_bounds
+    lons, lats, data = raster["lons"], raster["lats"], raster["data"]
+    col_mask = (lons >= lon_min) & (lons <= lon_max)
+    row_mask = (lats >= lat_min) & (lats <= lat_max)
+    return data[np.ix_(row_mask, col_mask)], lons[col_mask], lats[row_mask]
+
+
+def sample_raster_at_point(raster, lat, lon, radius_deg=2.0):
+    """Return mean raster value within radius_deg of (lat, lon)."""
+    lons, lats, data = raster["lons"], raster["lats"], raster["data"]
+    col_mask = (lons >= lon - radius_deg) & (lons <= lon + radius_deg)
+    row_mask = (lats >= lat - radius_deg) & (lats <= lat + radius_deg)
+    patch = data[np.ix_(row_mask, col_mask)]
+    valid = patch[~np.isnan(patch)]
+    return float(np.mean(valid)) if len(valid) > 0 else np.nan
+
+
+@st.cache_data(show_spinner="Sampling precipitation at country centroids…")
+def build_hdi_precip_df(_raster_data, _raster_lons, _raster_lats, radius_deg=2.5):
+    """
+    For each country in HDI_DF, sample the mean precipitation trend within
+    radius_deg of its centroid. Returns merged DataFrame.
+    """
+    raster_proxy = {
+        "lons": _raster_lons,
+        "lats": _raster_lats,
+        "data": _raster_data,
+    }
+    precip_vals = []
+    for _, row in HDI_DF.iterrows():
+        val = sample_raster_at_point(raster_proxy, row["lat"], row["lon"], radius_deg)
+        precip_vals.append(val)
+
+    df = HDI_DF.copy()
+    df["precip_trend"] = precip_vals
+    df = df.dropna(subset=["precip_trend"])
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Plotting helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+def make_precip_map(data, lons, lats, cmap_name, vmin, vmax, title=""):
+    fig = go.Figure(go.Heatmap(
+        z          = data,
+        x          = lons,
+        y          = lats,
+        zmin       = vmin,
+        zmax       = vmax,
+        colorscale = cmap_name,
+        colorbar   = dict(
+            title       = dict(text="mm/yr", side="right",
+                               font=dict(size=11, color="#8b949e")),
+            tickfont    = dict(size=10, color="#8b949e"),
+            thickness   = 14,
+            len         = 0.75,
+            bgcolor     = "rgba(22,27,34,0.8)",
+            bordercolor = "#30363d",
+            borderwidth = 1,
+        ),
+        hovertemplate="Lon: %{x:.2f}°<br>Lat: %{y:.2f}°<br>Precip Trend: %{z:.4f} mm/yr<extra></extra>",
+    ))
+    # Overlay country centroids coloured by HDI tier
+    for tier, color in HDI_TIER_COLORS.items():
+        subset = HDI_DF[HDI_DF["tier"] == tier]
+        if len(subset) == 0:
+            continue
+        fig.add_trace(go.Scatter(
+            x    = subset["lon"],
+            y    = subset["lat"],
+            mode = "markers",
+            name = tier,
+            marker = dict(
+                color  = color,
+                size   = 7,
+                line   = dict(color="#0f1117", width=0.8),
+                symbol = "circle",
+            ),
+            text           = subset["country"] + "<br>HDI: " + subset["hdi"].round(3).astype(str),
+            hovertemplate  = "%{text}<extra></extra>",
+            showlegend     = True,
+        ))
+    fig.update_layout(
+        title        = dict(text=title, font=dict(family="IBM Plex Mono", size=14,
+                                                   color="#e8e8e8"), x=0.01),
+        xaxis        = dict(title="Longitude", showgrid=False, color="#8b949e",
+                            tickfont=dict(size=10), zeroline=False),
+        yaxis        = dict(title="Latitude",  showgrid=False, color="#8b949e",
+                            tickfont=dict(size=10), zeroline=False,
+                            scaleanchor="x", scaleratio=1),
+        legend       = dict(
+            bgcolor    = "rgba(22,27,34,0.9)",
+            bordercolor= "#30363d",
+            borderwidth= 1,
+            font       = dict(color="#8b949e", size=10),
+            title      = dict(text="HDI Tier", font=dict(color="#8b949e", size=10)),
+        ),
+        paper_bgcolor= "#0f1117",
+        plot_bgcolor = "#0f1117",
+        height       = 560,
+        margin       = dict(l=50, r=20, t=50, b=40),
+    )
+    return fig
+
+
+def make_scatter(df, color_mode="region", show_regression=True,
+                 x_col="hdi", y_col="precip_trend"):
+    if color_mode == "region":
+        color_col   = "region"
+        color_map   = REGION_COLORS
+        legend_title= "Region"
+    else:
+        color_col   = "tier"
+        color_map   = HDI_TIER_COLORS
+        legend_title= "HDI Tier"
+
+    traces = []
+    for group_val in df[color_col].unique():
+        sub = df[df[color_col] == group_val]
+        color = color_map.get(group_val, "#8b949e")
+        traces.append(go.Scatter(
+            x              = sub[x_col],
+            y              = sub[y_col],
+            mode           = "markers",
+            name           = group_val,
+            marker         = dict(color=color, size=9,
+                                  line=dict(color="#0f1117", width=0.8)),
+            text           = sub["country"],
+            hovertemplate  = (
+                "<b>%{text}</b><br>"
+                f"HDI: %{{x:.3f}}<br>"
+                f"Precip Trend: %{{y:.4f}} mm/yr<extra></extra>"
+            ),
+        ))
+
+    fig = go.Figure(traces)
+
+    if show_regression and HAS_SCIPY and len(df) > 3:
+        valid = df[[x_col, y_col]].dropna()
+        slope, intercept, r_value, p_value, _ = stats.linregress(
+            valid[x_col], valid[y_col]
+        )
+        x_range = np.linspace(valid[x_col].min(), valid[x_col].max(), 100)
+        y_range = slope * x_range + intercept
+        fig.add_trace(go.Scatter(
+            x          = x_range,
+            y          = y_range,
+            mode       = "lines",
+            name       = f"OLS fit (r²={r_value**2:.3f}, p={p_value:.3f})",
+            line       = dict(color="#58a6ff", width=2, dash="dash"),
+            showlegend = True,
+        ))
+        # Annotation
+        fig.add_annotation(
+            x    = valid[x_col].max() * 0.97,
+            y    = y_range[-1],
+            text = (f"r² = {r_value**2:.3f}<br>"
+                    f"p  = {p_value:.4f}<br>"
+                    f"slope = {slope:.4f}"),
+            showarrow   = False,
+            font        = dict(color="#58a6ff", size=11, family="IBM Plex Mono"),
+            bgcolor     = "rgba(22,27,34,0.85)",
+            bordercolor = "#30363d",
+            borderwidth = 1,
+            align       = "right",
+        )
+
+    fig.update_layout(
+        xaxis = dict(
+            title     = "Human Development Index (HDI, 2022)",
+            color     = "#8b949e",
+            tickfont  = dict(size=10),
+            gridcolor = "#21262d",
+            range     = [0.35, 1.00],
+        ),
+        yaxis = dict(
+            title     = "Mean Precipitation Trend (mm/yr)",
+            color     = "#8b949e",
+            tickfont  = dict(size=10),
+            gridcolor = "#21262d",
+            zeroline  = True,
+            zerolinecolor = "#30363d",
+            zerolinewidth = 1,
+        ),
+        legend = dict(
+            bgcolor    = "rgba(22,27,34,0.9)",
+            bordercolor= "#30363d",
+            borderwidth= 1,
+            font       = dict(color="#8b949e", size=10),
+            title      = dict(text=legend_title, font=dict(color="#8b949e", size=10)),
+        ),
+        paper_bgcolor= "#0f1117",
+        plot_bgcolor = "#161b22",
+        height       = 540,
+        margin       = dict(l=60, r=30, t=20, b=50),
+    )
+    return fig
+
+
+def make_box_by_tier(df):
+    fig = go.Figure()
+    tier_order = list(HDI_TIERS.keys())
+    for tier in tier_order:
+        sub    = df[df["tier"] == tier]["precip_trend"].dropna()
+        color  = HDI_TIER_COLORS[tier]
+        if len(sub) == 0:
+            continue
+        fig.add_trace(go.Box(
+            y              = sub,
+            name           = tier,
+            marker_color   = color,
+            line_color     = color,
+            fillcolor      = color.replace(")", ", 0.25)").replace("rgb", "rgba") if "rgb" in color else color + "40",
+            boxmean        = True,
+            hovertemplate  = "Precip Trend: %{y:.4f} mm/yr<extra></extra>",
+        ))
+    fig.add_hline(y=0, line_color="#8b949e", line_dash="dash", line_width=1)
+    fig.update_layout(
+        xaxis        = dict(color="#8b949e", tickfont=dict(size=10)),
+        yaxis        = dict(title="Precip Trend (mm/yr)", color="#8b949e",
+                            tickfont=dict(size=10), gridcolor="#21262d"),
+        paper_bgcolor= "#0f1117",
+        plot_bgcolor = "#161b22",
+        height       = 380,
+        margin       = dict(l=60, r=20, t=20, b=40),
+        showlegend   = False,
+    )
+    return fig
+
+
+def make_box_by_region(df):
+    region_means = df.groupby("region")["precip_trend"].median().sort_values()
+    ordered      = region_means.index.tolist()
+    fig = go.Figure()
+    for region in ordered:
+        sub   = df[df["region"] == region]["precip_trend"].dropna()
+        color = REGION_COLORS.get(region, "#8b949e")
+        if len(sub) == 0:
+            continue
+        fig.add_trace(go.Box(
+            y              = sub,
+            name           = region,
+            marker_color   = color,
+            line_color     = color,
+            boxmean        = True,
+            hovertemplate  = "Precip Trend: %{y:.4f} mm/yr<extra></extra>",
+        ))
+    fig.add_hline(y=0, line_color="#8b949e", line_dash="dash", line_width=1)
+    fig.update_layout(
+        xaxis        = dict(color="#8b949e", tickfont=dict(size=9),
+                            tickangle=20),
+        yaxis        = dict(title="Precip Trend (mm/yr)", color="#8b949e",
+                            tickfont=dict(size=10), gridcolor="#21262d"),
+        paper_bgcolor= "#0f1117",
+        plot_bgcolor = "#161b22",
+        height       = 380,
+        margin       = dict(l=60, r=20, t=20, b=80),
+        showlegend   = False,
+    )
+    return fig
+
+
+def make_histogram(data_flat, vmin, vmax, cmap_name, bins=80):
+    valid = data_flat[~np.isnan(data_flat)]
+    valid = valid[(valid >= vmin) & (valid <= vmax)]
+    counts, edges = np.histogram(valid, bins=bins, range=(vmin, vmax))
+    centres = (edges[:-1] + edges[1:]) / 2
+    cmap    = plt.get_cmap(cmap_name)
+    norm    = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    colors  = [f"rgba{tuple(int(c*255) for c in cmap(norm(v))[:3]) + (0.85,)}"
+               for v in centres]
+
+    fig = go.Figure(go.Bar(
+        x                 = centres,
+        y                 = counts,
+        marker_color      = colors,
+        marker_line_width = 0,
+        hovertemplate     = "Trend: %{x:.4f} mm/yr<br>Count: %{y:,}<extra></extra>",
+    ))
+    fig.add_vline(x=0, line_color="#58a6ff", line_dash="dash", line_width=1.5,
+                  annotation_text="0", annotation_font_color="#58a6ff",
+                  annotation_font_size=10)
+    fig.update_layout(
+        xaxis        = dict(title="Precip Trend (mm/yr)", color="#8b949e",
+                            tickfont=dict(size=10), gridcolor="#21262d"),
+        yaxis        = dict(title="Pixel Count", color="#8b949e",
+                            tickfont=dict(size=10), gridcolor="#21262d"),
+        bargap       = 0.02,
+        paper_bgcolor= "#0f1117",
+        plot_bgcolor = "#161b22",
+        height       = 320,
+        margin       = dict(l=50, r=20, t=20, b=40),
+        showlegend   = False,
+    )
+    return fig
+
+
+def make_zonal_bar(data, lats):
+    zonal  = np.nanmean(data, axis=1)
+    valid  = ~np.isnan(zonal)
+    colors = ["#3498db" if v > 0 else "#e74c3c" for v in zonal[valid]]
+    fig = go.Figure(go.Bar(
+        x                 = zonal[valid],
+        y                 = lats[valid],
+        orientation       = "h",
+        marker_color      = colors,
+        marker_line_width = 0,
+        hovertemplate     = "Lat: %{y:.1f}°<br>Mean Trend: %{x:.4f} mm/yr<extra></extra>",
+    ))
+    fig.add_vline(x=0, line_color="#8b949e", line_dash="dash", line_width=1)
+    fig.update_layout(
+        xaxis        = dict(title="Mean Precip Trend (mm/yr)", color="#8b949e",
+                            tickfont=dict(size=10), gridcolor="#21262d"),
+        yaxis        = dict(title="Latitude", color="#8b949e",
+                            tickfont=dict(size=10), gridcolor="#21262d"),
+        paper_bgcolor= "#0f1117",
+        plot_bgcolor = "#161b22",
+        height       = 440,
+        margin       = dict(l=60, r=20, t=30, b=40),
+    )
+    return fig
+
+
+def make_longitudinal_bar(data, lons):
+    lonmean = np.nanmean(data, axis=0)
+    valid   = ~np.isnan(lonmean)
+    colors  = ["#3498db" if v > 0 else "#e74c3c" for v in lonmean[valid]]
+    fig = go.Figure(go.Bar(
+        x                 = lons[valid],
+        y                 = lonmean[valid],
+        marker_color      = colors,
+        marker_line_width = 0,
+        hovertemplate     = "Lon: %{x:.1f}°<br>Mean Trend: %{y:.4f} mm/yr<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_color="#8b949e", line_dash="dash", line_width=1)
+    fig.update_layout(
+        xaxis        = dict(title="Longitude", color="#8b949e",
+                            tickfont=dict(size=10), gridcolor="#21262d"),
+        yaxis        = dict(title="Mean Precip Trend (mm/yr)", color="#8b949e",
+                            tickfont=dict(size=10), gridcolor="#21262d"),
+        paper_bgcolor= "#0f1117",
+        plot_bgcolor = "#161b22",
+        height       = 320,
+        margin       = dict(l=60, r=20, t=30, b=40),
+    )
+    return fig
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Header
+# ═══════════════════════════════════════════════════════════════════════════════
+st.markdown("# 🌧️ HDI × GPM Precipitation Trend Explorer")
+st.markdown(
+    "<span style='font-family:IBM Plex Mono;font-size:12px;color:#8b949e;'>"
+    "Relationship between Human Development Index (UNDP, 2022) and long-term "
+    "precipitation trends &nbsp;·&nbsp; mm/year &nbsp;·&nbsp; "
+    "NASA GPM IMERG 2001–2023"
+    "</span>",
+    unsafe_allow_html=True,
+)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dependency & file guards
+# ═══════════════════════════════════════════════════════════════════════════════
+if not HAS_RASTERIO:
+    st.error("**rasterio** is required. Install with: `pip install rasterio`")
+    st.stop()
+
+if not Path(TIFF_FILE).exists():
+    st.error(
+        f"**{TIFF_FILE}** not found in the current directory.\n\n"
+        "Place `GPM_IMERG_Precipitation_Trend_2001_2023.tif` in the same "
+        "folder as the main app."
+    )
+    st.stop()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Sidebar controls
+# ═══════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown("### ⚙️ Controls")
+
+    downsample = st.select_slider(
+        "Resolution (lower = faster)",
+        options=[1, 2, 4, 8, 16],
+        value=4,
+        help="Downsampling factor. 1 = native resolution (may be slow).",
+    )
+
+    st.markdown("---")
+
+    region_name   = st.selectbox("Region / Zoom", list(REGIONS.keys()), index=0)
+    region_bounds = REGIONS[region_name]
+
+    st.markdown("---")
+
+    cmap_label = st.selectbox("Colour palette", list(COLORMAPS.keys()), index=0)
+    cmap_name  = COLORMAPS[cmap_label]
+
+    reverse_cmap = st.checkbox("Reverse palette", value=False)
+    if reverse_cmap:
+        cmap_name = (cmap_name + "_r") if not cmap_name.endswith("_r") else cmap_name[:-2]
+
+    st.markdown("---")
+
+    st.markdown("**Colour range clipping**")
+    use_percentile = st.checkbox("Clip by percentile", value=True)
+    if use_percentile:
+        pct_low  = st.slider("Lower percentile", 0,  49,  2)
+        pct_high = st.slider("Upper percentile", 51, 100, 98)
+    else:
+        manual_min = st.number_input("Min value (mm/yr)", value=-20.0, step=1.0, format="%.1f")
+        manual_max = st.number_input("Max value (mm/yr)", value= 20.0, step=1.0, format="%.1f")
+
+    make_symmetric = st.checkbox("Force symmetric colour range", value=True)
+
+    st.markdown("---")
+
+    smooth = st.checkbox("Apply Gaussian smoothing", value=False)
+    if smooth:
+        sigma = st.slider("Smoothing sigma (pixels)", 1, 10, 3)
+
+    st.markdown("---")
+
+    radius_deg = st.slider(
+        "Sampling radius (°) for country extraction",
+        min_value=0.5, max_value=5.0, value=2.5, step=0.5,
+        help="Radius around each country centroid used to compute mean precipitation trend.",
+    )
+
+    show_scatter_regression = st.checkbox("Show regression line", value=True)
+    scatter_color_mode      = st.radio("Scatter colour by", ["region", "HDI tier"],
+                                       horizontal=True)
+
+    st.markdown("---")
+    st.markdown(
+        "<span style='font-family:IBM Plex Mono;font-size:10px;color:#8b949e;'>"
+        "Precipitation: NASA GPM IMERG<br>"
+        "HDI: UNDP Human Development Report 2023"
+        "</span>",
+        unsafe_allow_html=True,
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Load & process raster
+# ═══════════════════════════════════════════════════════════════════════════════
+raster = load_tiff(TIFF_FILE, downsample=downsample)
+data_crop, lons_crop, lats_crop = crop_to_region(raster, region_bounds)
+
+if smooth and HAS_SCIPY:
+    data_smooth  = ndimage.gaussian_filter(
+        np.where(np.isnan(data_crop), 0, data_crop), sigma=sigma
+    )
+    data_display = np.where(np.isnan(data_crop), np.nan, data_smooth)
+elif smooth and not HAS_SCIPY:
+    st.sidebar.warning("scipy not installed — smoothing unavailable.")
+    data_display = data_crop
+else:
+    data_display = data_crop
+
+valid_flat = data_display[~np.isnan(data_display)].ravel()
+if use_percentile and len(valid_flat) > 0:
+    vmin = float(np.percentile(valid_flat, pct_low))
+    vmax = float(np.percentile(valid_flat, pct_high))
+else:
+    vmin, vmax = manual_min, manual_max
+
+if make_symmetric:
+    extreme  = max(abs(vmin), abs(vmax))
+    vmin, vmax = -extreme, extreme
+
+# ── Build HDI × precip table ──────────────────────────────────────────────────
+merged_df = build_hdi_precip_df(
+    raster["data"], raster["lons"], raster["lats"], radius_deg=radius_deg
+)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Summary metrics
+# ═══════════════════════════════════════════════════════════════════════════════
+valid_all  = raster["data"][~np.isnan(raster["data"])].ravel()
+valid_crop = data_crop[~np.isnan(data_crop)].ravel()
+pct_wetter = 100 * np.mean(valid_all > 0)
+pct_drier  = 100 * np.mean(valid_all < 0)
+
+if HAS_SCIPY and len(merged_df) > 3:
+    slope_val, _, r_val, p_val, _ = stats.linregress(
+        merged_df["hdi"], merged_df["precip_trend"]
+    )
+    r2_str = f"{r_val**2:.3f}"
+    p_str  = f"{p_val:.4f}"
+else:
+    slope_val = np.nan
+    r2_str    = "n/a"
+    p_str     = "n/a"
+
+col1, col2, col3, col4, col5, col6 = st.columns(6)
+col1.metric("Mean trend",     f"{np.nanmean(valid_all):+.3f}",  "mm/yr")
+col2.metric("Std dev",        f"{np.nanstd(valid_all):.3f}",    "mm/yr")
+col3.metric("Wetter pixels",  f"{pct_wetter:.1f}%",
+            f"vs {pct_drier:.1f}% drier")
+col4.metric("Countries sampled", f"{len(merged_df)}", "of 140+")
+col5.metric("HDI–Precip r²",  r2_str, "OLS fit")
+col6.metric("p-value",        p_str,  "HDI vs trend")
+
+st.markdown("---")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tabs
+# ═══════════════════════════════════════════════════════════════════════════════
+tab_map, tab_scatter, tab_tiers, tab_hist, tab_zonal, tab_stats, tab_export = st.tabs([
+    "🗺️  Map",
+    "📈  HDI vs Precip",
+    "🏷️  HDI Tiers",
+    "📊  Histogram",
+    "🌐  Zonal Analysis",
+    "📋  Statistics",
+    "💾  Export",
+])
+
+# ── Tab 1: Map ────────────────────────────────────────────────────────────────
+with tab_map:
+    map_title = f"GPM Precipitation Trend 2001–2023 — {region_name} (with HDI overlay)"
+    fig_map   = make_precip_map(
+        data_display, lons_crop, lats_crop,
+        cmap_name, vmin, vmax, title=map_title
+    )
+    st.plotly_chart(fig_map, use_container_width=True)
+    st.caption(
+        f"CRS: {raster['crs']} · "
+        f"Native resolution: {raster['orig_shape'][1]}×{raster['orig_shape'][0]} px · "
+        f"Display downsampled ×{downsample} · "
+        f"Colour range: [{vmin:.3f}, {vmax:.3f}] mm/yr — "
+        f"Dots show country centroids coloured by HDI tier"
+    )
+
+# ── Tab 2: HDI vs Precip Scatter ──────────────────────────────────────────────
+with tab_scatter:
+    st.markdown('<div class="section-header">HDI vs Mean Precipitation Trend</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        "Each point is one country. Precipitation trend is the mean value "
+        "sampled within the chosen radius of the country centroid."
+    )
+
+    fig_scatter = make_scatter(
+        merged_df,
+        color_mode       = "region" if scatter_color_mode == "region" else "tier",
+        show_regression  = show_scatter_regression,
+    )
+    st.plotly_chart(fig_scatter, use_container_width=True)
+
+    # Pearson & Spearman
+    if HAS_SCIPY and len(merged_df) > 3:
+        sp_r, sp_p = stats.spearmanr(merged_df["hdi"], merged_df["precip_trend"])
+        st.markdown('<div class="section-header">Correlation Statistics</div>',
+                    unsafe_allow_html=True)
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        cc1.metric("Pearson r²",    r2_str)
+        cc2.metric("Pearson p",     p_str)
+        cc3.metric("Spearman ρ",    f"{sp_r:.3f}")
+        cc4.metric("Spearman p",    f"{sp_p:.4f}")
+
+        st.markdown(
+            "<span style='font-size:12px;color:#8b949e;'>"
+            "⚠️ Correlation does not imply causation. Many confounding variables "
+            "(geography, climate zone, industrialisation) co-vary with HDI."
+            "</span>",
+            unsafe_allow_html=True,
+        )
+
+# ── Tab 3: HDI Tiers breakdown ────────────────────────────────────────────────
+with tab_tiers:
+    st.markdown('<div class="section-header">Precipitation Trend by HDI Tier</div>',
+                unsafe_allow_html=True)
+    fig_box_tier = make_box_by_tier(merged_df)
+    st.plotly_chart(fig_box_tier, use_container_width=True)
+
+    st.markdown('<div class="section-header">Precipitation Trend by Region</div>',
+                unsafe_allow_html=True)
+    fig_box_reg = make_box_by_region(merged_df)
+    st.plotly_chart(fig_box_reg, use_container_width=True)
+
+    # Summary table
+    st.markdown('<div class="section-header">Per-Tier Summary Statistics</div>',
+                unsafe_allow_html=True)
+    tier_stats = []
+    for tier in HDI_TIERS:
+        sub = merged_df[merged_df["tier"] == tier]["precip_trend"]
+        if len(sub) == 0:
+            continue
+        tier_stats.append({
+            "HDI Tier"       : tier,
+            "N countries"    : len(sub),
+            "Mean (mm/yr)"   : f"{sub.mean():+.4f}",
+            "Median (mm/yr)" : f"{sub.median():+.4f}",
+            "Std (mm/yr)"    : f"{sub.std():.4f}",
+            "% Wetting"      : f"{100*(sub > 0).mean():.1f}%",
+            "% Drying"       : f"{100*(sub < 0).mean():.1f}%",
+        })
+    st.dataframe(pd.DataFrame(tier_stats), use_container_width=True, hide_index=True)
+
+# ── Tab 4: Histogram ──────────────────────────────────────────────────────────
+with tab_hist:
+    st.markdown('<div class="section-header">Global Pixel Distribution</div>',
+                unsafe_allow_html=True)
+    bins     = st.slider("Number of bins", 20, 200, 80, key="hist_bins")
+    fig_hist = make_histogram(valid_crop, vmin, vmax, cmap_name, bins=bins)
+    st.plotly_chart(fig_hist, use_container_width=True)
+
+    st.markdown('<div class="section-header">Percentile Summary</div>',
+                unsafe_allow_html=True)
+    pcts     = [1, 5, 10, 25, 50, 75, 90, 95, 99]
+    pct_vals = np.nanpercentile(valid_crop, pcts)
+    pct_df   = pd.DataFrame({
+        "Percentile"   : [f"P{p}" for p in pcts],
+        "Value (mm/yr)": [f"{v:+.4f}" for v in pct_vals],
+        "Direction"    : ["🔵 Wetter" if v > 0 else "🟠 Drier" for v in pct_vals],
+    })
+    st.dataframe(pct_df, use_container_width=True, hide_index=True)
+
+# ── Tab 5: Zonal Analysis ─────────────────────────────────────────────────────
+with tab_zonal:
+    st.markdown('<div class="section-header">Zonal Mean (by Latitude)</div>',
+                unsafe_allow_html=True)
+    fig_zonal = make_zonal_bar(data_display, lats_crop)
+    st.plotly_chart(fig_zonal, use_container_width=True)
+
+    st.markdown('<div class="section-header">Longitudinal Mean (by Longitude)</div>',
+                unsafe_allow_html=True)
+    fig_lon = make_longitudinal_bar(data_display, lons_crop)
+    st.plotly_chart(fig_lon, use_container_width=True)
+
+# ── Tab 6: Statistics ─────────────────────────────────────────────────────────
+with tab_stats:
+    st.markdown('<div class="section-header">Global Raster Statistics</div>',
+                unsafe_allow_html=True)
+    stat_rows = [
+        ("Mean trend",           f"{np.nanmean(valid_all):+.5f}",   "mm/yr"),
+        ("Median trend",         f"{np.nanmedian(valid_all):+.5f}", "mm/yr"),
+        ("Std deviation",        f"{np.nanstd(valid_all):.5f}",     "mm/yr"),
+        ("Max (wettest trend)",  f"{np.nanmax(valid_all):+.5f}",    "mm/yr"),
+        ("Min (driest trend)",   f"{np.nanmin(valid_all):+.5f}",    "mm/yr"),
+        ("% pixels wetting",     f"{pct_wetter:.2f}",               "%"),
+        ("% pixels drying",      f"{pct_drier:.2f}",                "%"),
+        ("Valid pixels",         f"{len(valid_all):,}",             "px"),
+        ("Native resolution",
+         f"{raster['orig_shape'][1]}×{raster['orig_shape'][0]}",    "px"),
+        ("CRS",                  raster["crs"],                     ""),
+        ("Bounds (W)",           f"{raster['bounds'].left:.4f}",    "°"),
+        ("Bounds (E)",           f"{raster['bounds'].right:.4f}",   "°"),
+        ("Bounds (S)",           f"{raster['bounds'].bottom:.4f}",  "°"),
+        ("Bounds (N)",           f"{raster['bounds'].top:.4f}",     "°"),
+    ]
+    st.dataframe(pd.DataFrame(stat_rows, columns=["Statistic", "Value", "Unit"]),
+                 use_container_width=True, hide_index=True)
+
+    st.markdown('<div class="section-header">HDI–Precipitation Country Table</div>',
+                unsafe_allow_html=True)
+    display_cols = ["country", "region", "tier", "hdi", "precip_trend"]
+    display_df   = merged_df[display_cols].copy()
+    display_df["hdi"]          = display_df["hdi"].round(3)
+    display_df["precip_trend"] = display_df["precip_trend"].round(5)
+    display_df = display_df.rename(columns={
+        "country"     : "Country",
+        "region"      : "Region",
+        "tier"        : "HDI Tier",
+        "hdi"         : "HDI (2022)",
+        "precip_trend": "Precip Trend (mm/yr)",
+    }).sort_values("HDI (2022)", ascending=False)
+    st.dataframe(display_df, use_container_width=True, hide_index=True, height=460)
+
+# ── Tab 7: Export ─────────────────────────────────────────────────────────────
+with tab_export:
+    st.markdown('<div class="section-header">Export Options</div>',
+                unsafe_allow_html=True)
+    col_a, col_b, col_c = st.columns(3)
+
+    with col_a:
+        st.markdown("**📄 Raster CSV — pixel values**")
+        st.caption("Flat table of lon, lat, precip trend for the current region.")
+        lon_grid, lat_grid = np.meshgrid(lons_crop, lats_crop)
+        raster_export_df = pd.DataFrame({
+            "longitude"           : lon_grid.ravel(),
+            "latitude"            : lat_grid.ravel(),
+            "precip_trend_mm_yr"  : data_display.ravel(),
+        }).dropna()
+        st.download_button(
+            label     = "⬇️ Download raster CSV",
+            data      = raster_export_df.to_csv(index=False).encode("utf-8"),
+            file_name = f"gpm_precip_trend_{region_name.lower().replace(' ', '_')}.csv",
+            mime      = "text/csv",
+        )
+        st.metric("Rows", f"{len(raster_export_df):,}")
+
+    with col_b:
+        st.markdown("**📄 HDI × Precip CSV**")
+        st.caption("Country-level table with HDI values and sampled precipitation trends.")
+        hdi_export = merged_df[["country", "region", "tier", "hdi", "precip_trend",
+                                 "lat", "lon"]].copy()
+        hdi_export["hdi"]          = hdi_export["hdi"].round(3)
+        hdi_export["precip_trend"] = hdi_export["precip_trend"].round(6)
+        st.download_button(
+            label     = "⬇️ Download HDI CSV",
+            data      = hdi_export.to_csv(index=False).encode("utf-8"),
+            file_name = "hdi_vs_precip_trend_countries.csv",
+            mime      = "text/csv",
+        )
+        st.metric("Countries", f"{len(hdi_export)}")
+
+    with col_c:
+        st.markdown("**🖼️ PNG — map image**")
+        st.caption("High-resolution static map of the precipitation trend.")
+
+        dpi = st.select_slider("DPI", [72, 150, 300], value=150, key="dpi_gpm")
+        if st.button("Generate PNG"):
+            fig_png, ax = plt.subplots(figsize=(14, 7), facecolor="#0f1117")
+            ax.set_facecolor("#0f1117")
+            cmap_obj = plt.get_cmap(cmap_name)
+            cmap_obj.set_bad(color="#0f1117")
+            im = ax.imshow(
+                data_display,
+                extent = [lons_crop[0], lons_crop[-1], lats_crop[-1], lats_crop[0]],
+                cmap   = cmap_obj,
+                vmin   = vmin,
+                vmax   = vmax,
+                aspect = "auto",
+                origin = "upper",
+            )
+            cb = fig_png.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+            cb.set_label("Precipitation Trend (mm/yr)", color="#8b949e", fontsize=10)
+            cb.ax.yaxis.set_tick_params(color="#8b949e", labelsize=8)
+            plt.setp(cb.ax.yaxis.get_ticklabels(), color="#8b949e")
+
+            # Overlay HDI-coloured country centroids
+            for tier, color in HDI_TIER_COLORS.items():
+                sub = HDI_DF[HDI_DF["tier"] == tier]
+                ax.scatter(sub["lon"], sub["lat"], c=color, s=20, linewidths=0.4,
+                           edgecolors="#0f1117", zorder=5, label=tier)
+            ax.legend(loc="lower left", fontsize=7, framealpha=0.7,
+                      facecolor="#161b22", edgecolor="#30363d",
+                      labelcolor="#8b949e")
+            ax.set_title(f"GPM Precipitation Trend 2001–2023 — {region_name}",
+                         color="#e8e8e8", fontsize=13, pad=12, fontfamily="monospace")
+            ax.set_xlabel("Longitude", color="#8b949e", fontsize=9)
+            ax.set_ylabel("Latitude",  color="#8b949e", fontsize=9)
+            ax.tick_params(colors="#8b949e", labelsize=8)
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#30363d")
+
+            buf = io.BytesIO()
+            fig_png.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
+                            facecolor="#0f1117")
+            buf.seek(0)
+            plt.close(fig_png)
+
+            st.download_button(
+                label     = "⬇️ Download PNG",
+                data      = buf,
+                file_name = f"gpm_precip_trend_{region_name.lower().replace(' ','_')}.png",
+                mime      = "image/png",
+            )
+            st.success("PNG ready — click the button above to save.")

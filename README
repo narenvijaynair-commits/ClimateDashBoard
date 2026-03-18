@@ -1,2 +1,4 @@
-conda activate GEE
+conda activate gee_dashboard
+unalias python (if it is not using the miniconda version)
 
+streamlit run app.py
