@@ -10,3 +10,4 @@ geemap
 folium
 streamlit-folium
 netCDF4
+rasterio
